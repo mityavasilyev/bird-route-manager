@@ -6,26 +6,111 @@
 #
 # One domain per line. Lines starting with # are ignored.
 
+# --- Amazon AWS ---
 checkip.amazonaws.com
-dnsleaktest.com
+
+# --- icanhazip (Cloudflare) ---
 icanhazip.com
+ipv4.icanhazip.com
+ipv6.icanhazip.com
+
+# --- ident.me ---
 ident.me
+4.ident.me
+6.ident.me
+tnedi.me
+
+# --- ifconfig ---
 ifconfig.me
 ipv4.ifconfig.me
 ipv6.ifconfig.me
+ifconfig.co
+
+# --- ip-api ---
 ip-api.com
-ip.nic.ru
+pro.ip-api.com
+
+# --- ip.sb ---
 ip.sb
-ip4.seeip.org
+api.ip.sb
+api-ipv4.ip.sb
+api-ipv6.ip.sb
+
+# --- seeip.org ---
+api.seeip.org
+ipv4.seeip.org
+ipv6.seeip.org
+
+# --- ipapi.co ---
 ipapi.co
+
+# --- ipecho.net ---
 ipecho.net
+
+# --- ipgeolocation.io ---
 ipgeolocation.io
+api.ipgeolocation.io
+
+# --- ipinfo.io ---
 ipinfo.io
+api.ipinfo.io
+v4.api.ipinfo.io
+v6.api.ipinfo.io
+
+# --- ipify.org ---
 ipify.org
 api.ipify.org
+api64.ipify.org
+api6.ipify.org
+
+# --- iplocate.io ---
 iplocate.io
+api.iplocate.io
+
+# --- ipstack.com ---
 ipstack.com
+api.ipstack.com
+
+# --- ipwhois / ipwho.is ---
 ipwhois.io
-maxmind.com
+ipwho.is
+
+# --- myexternalip.com ---
 myexternalip.com
+ipv4.myexternalip.com
+ipv6.myexternalip.com
+
+# --- wtfismyip / myip.wtf ---
+wtfismyip.com
+myip.wtf
+
+# --- checkip.dyndns.org ---
+checkip.dyndns.org
+
+# --- ipconfig.io ---
+ipconfig.io
+
+# --- myip.com ---
+myip.com
+api.myip.com
+
+# --- ipdata.co ---
+api.ipdata.co
+
+# --- ipregistry.co ---
+api.ipregistry.co
+
+# --- ipapi.is ---
+api.ipapi.is
+
+# --- maxmind.com ---
+maxmind.com
+geoip.maxmind.com
+geolite.info
+
+# --- dnsleaktest.com ---
+dnsleaktest.com
+
+# --- Russian/regional ---
+ip.nic.ru
 reg.ru
