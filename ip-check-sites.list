@@ -114,6 +114,8 @@ dnsleaktest.com
 # --- whatismyip.com ---
 www.whatismyip.com
 whatismyip.com
+wimi-api-v4.whatismyip.com
+wimi-api-v6.whatismyip.com
 
 # --- Russian/regional ---
 ip.nic.ru
