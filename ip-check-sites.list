@@ -1,0 +1,31 @@
+# ip-check-sites.list — domains of IP-echo services
+#
+# bird-route-manager resolves these domains at every apply and adds their IPs
+# to the ISP route list, so they are always reachable via ISP and never
+# accidentally routed through the VPN.
+#
+# One domain per line. Lines starting with # are ignored.
+
+checkip.amazonaws.com
+dnsleaktest.com
+icanhazip.com
+ident.me
+ifconfig.me
+ipv4.ifconfig.me
+ipv6.ifconfig.me
+ip-api.com
+ip.nic.ru
+ip.sb
+ip4.seeip.org
+ipapi.co
+ipecho.net
+ipgeolocation.io
+ipinfo.io
+ipify.org
+api.ipify.org
+iplocate.io
+ipstack.com
+ipwhois.io
+maxmind.com
+myexternalip.com
+reg.ru

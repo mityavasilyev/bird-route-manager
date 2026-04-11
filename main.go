@@ -49,105 +49,6 @@ type Resolver interface {
 	LookupASN(asn string) ([]string, error)
 }
 
-// Checker detects the VPN exit IP by probing external IP-echo services
-// through the VPN interface. The interface exists so tests can inject a fake.
-type Checker interface {
-	DetectExitIP(ctx context.Context, iface string) (string, error)
-}
-
-// ── VPN IP checker ────────────────────────────────────────────────────────────
-
-// probeCheckDomains are the IP-echo service domains used by the VPN exit IP checker.
-// When VPN IP check is enabled, these are auto-added to the ISP route list so they
-// are always reachable via ISP (not VPN), preventing detection loops.
-var probeCheckDomains = []string{
-	"icanhazip.com",
-	"api.ipify.org",
-	"checkip.amazonaws.com",
-	"ident.me",
-	"ipecho.net",
-	"ip.sb",
-	"ip4.seeip.org",
-	"myexternalip.com",
-	"ifconfig.me",
-}
-
-// probeCheckURLs are the HTTP endpoints queried to detect the VPN exit IP.
-// Each returns a bare IPv4 address as plain text. Tried in order; first success wins.
-var probeCheckURLs = []string{
-	"https://icanhazip.com",
-	"https://api.ipify.org",
-	"https://checkip.amazonaws.com",
-	"https://ident.me",
-	"https://ipecho.net/plain",
-	"https://ip.sb",
-	"https://ip4.seeip.org",
-	"https://myexternalip.com/raw",
-	"https://ifconfig.me/ip",
-}
-
-type netChecker struct{}
-
-// bindToDevice returns a Control func that pins a TCP socket to iface via
-// SO_BINDTODEVICE (Linux constant 25). This overrides the routing table,
-// forcing the connection out that interface regardless of the kernel's routing
-// decision for the destination. On non-Linux platforms the setsockopt call
-// returns an error and the probe is skipped.
-func bindToDevice(iface string) func(string, string, syscall.RawConn) error {
-	return func(_, _ string, c syscall.RawConn) error {
-		var innerErr error
-		if err := c.Control(func(fd uintptr) {
-			innerErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, 25 /*SO_BINDTODEVICE*/, iface)
-		}); err != nil {
-			return err
-		}
-		return innerErr
-	}
-}
-
-func (netChecker) DetectExitIP(ctx context.Context, iface string) (string, error) {
-	dialer := &net.Dialer{
-		Timeout: 5 * time.Second,
-		Control: bindToDevice(iface),
-	}
-	client := &http.Client{
-		Transport: &http.Transport{DialContext: dialer.DialContext},
-		Timeout:   5 * time.Second,
-	}
-
-	var lastErr error
-	for _, u := range probeCheckURLs {
-		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
-		if err != nil {
-			cancel()
-			lastErr = err
-			continue
-		}
-		resp, err := client.Do(req)
-		cancel()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("%s: read: %w", u, err)
-			continue
-		}
-		ip := strings.TrimSpace(string(body))
-		if net.ParseIP(ip) != nil {
-			return ip, nil
-		}
-		lastErr = fmt.Errorf("%s: unexpected body %q", u, ip)
-	}
-	if lastErr != nil {
-		return "", fmt.Errorf("all probes failed: %w", lastErr)
-	}
-	return "", errors.New("no probes configured")
-}
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
 // Config is populated from environment variables.
@@ -179,13 +80,6 @@ type Config struct {
 
 	// MaxBodyBytes is the hard cap on request body size.
 	MaxBodyBytes int64
-
-	// VPNIPCheckEnabled enables periodic detection of the VPN exit IP via IP-echo
-	// services. When enabled, probe domains are auto-added to the ISP route list.
-	VPNIPCheckEnabled bool
-
-	// VPNIPCheckInterval is how often the VPN exit IP is re-detected.
-	VPNIPCheckInterval time.Duration
 }
 
 func configFromEnv() Config {
@@ -197,9 +91,7 @@ func configFromEnv() Config {
 		RefreshInterval: time.Duration(envOrInt("REFRESH_HOURS", 6)) * time.Hour,
 		TimestampWindow: time.Duration(envOrInt("TIMESTAMP_WINDOW", 300)) * time.Second,
 		RateLimitMax:    envOrInt("RATE_LIMIT_MAX", 5),
-		MaxBodyBytes:       64 * 1024,
-		VPNIPCheckEnabled:  os.Getenv("VPN_IP_CHECK_ENABLED") == "true",
-		VPNIPCheckInterval: time.Duration(envOrInt("VPN_IP_CHECK_INTERVAL_HOURS", 6)) * time.Hour,
+		MaxBodyBytes:    64 * 1024,
 	}
 }
 
@@ -465,21 +357,15 @@ type State struct {
 	VPN       []string  `json:"vpn"`
 	ISP       []string  `json:"isp"`
 	UpdatedAt time.Time `json:"updated_at"`
-
-	VPNExitIP    string `json:"vpn_exit_ip,omitempty"`    // detected VPN exit IP
-	VPNExitIPAt  string `json:"vpn_exit_ip_at,omitempty"` // RFC3339 timestamp of last detection
-	VPNRouteCount int   `json:"vpn_route_count,omitempty"`
-	ISPRouteCount int   `json:"isp_route_count,omitempty"`
 }
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
 // Manager owns the state and coordinates resolution, file writing, and reload.
 type Manager struct {
-	cfg     Config
-	exec    Executor
-	res     Resolver
-	checker Checker // nil when VPN IP check is disabled
+	cfg  Config
+	exec Executor
+	res  Resolver
 
 	mu    sync.Mutex
 	state State
@@ -550,14 +436,7 @@ func (m *Manager) Update(vpn, isp []string) (vpnRoutes, ispRoutes int, err error
 		return 0, 0, applyErr
 	}
 
-	m.state = State{
-		VPN:           vpn,
-		ISP:           isp,
-		VPNExitIP:     m.state.VPNExitIP,    // preserve detected exit IP across pushes
-		VPNExitIPAt:   m.state.VPNExitIPAt,
-		VPNRouteCount: len(vpnCIDRs),
-		ISPRouteCount: len(ispCIDRs),
-	}
+	m.state = State{VPN: vpn, ISP: isp}
 	if saveErr := m.saveStateLocked(); saveErr != nil {
 		// Non-fatal: routes are applied, but we log the persistence failure.
 		log.Printf("warn: save state: %v", saveErr)
@@ -588,13 +467,31 @@ func (m *Manager) Refresh() {
 // apply resolves entries, writes files, and reloads BIRD2 (no lock held).
 func (m *Manager) apply(vpn, isp []string) error {
 	m.mu.Lock()
-	vpnCIDRs, ispCIDRs, err := m.applyLocked(vpn, isp)
-	if err == nil {
-		m.state.VPNRouteCount = len(vpnCIDRs)
-		m.state.ISPRouteCount = len(ispCIDRs)
-	}
+	_, _, err := m.applyLocked(vpn, isp)
 	m.mu.Unlock()
 	return err
+}
+
+// loadIPCheckSites reads WorkDir/ip-check-sites.list and returns the domain list.
+// Lines starting with # and blank lines are ignored. Returns nil if the file
+// does not exist.
+func loadIPCheckSites(workDir string) []string {
+	data, err := os.ReadFile(filepath.Join(workDir, "ip-check-sites.list"))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("warn: read ip-check-sites.list: %v", err)
+		}
+		return nil
+	}
+	var out []string
+	for line := range strings.SplitSeq(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 // applyLocked resolves, writes, and reloads. Caller must hold m.mu.
@@ -605,10 +502,8 @@ func (m *Manager) applyLocked(vpn, isp []string) (vpnCIDRs, ispCIDRs []string, e
 	}
 
 	ispEntries := isp
-	if m.cfg.VPNIPCheckEnabled {
-		// Probe domains are appended to ISP entries so their IPs are always routed
-		// via ISP. SO_BINDTODEVICE in the checker overrides this for detection requests.
-		ispEntries = append(append([]string(nil), isp...), probeCheckDomains...)
+	if sites := loadIPCheckSites(m.cfg.WorkDir); len(sites) > 0 {
+		ispEntries = append(append([]string(nil), isp...), sites...)
 	}
 
 	log.Printf("resolving %d vpn + %d isp entries", len(vpn), len(isp))
@@ -654,45 +549,6 @@ func (m *Manager) StartRefresher(ctx context.Context) {
 				return
 			case <-t.C:
 				m.Refresh()
-			}
-		}
-	}()
-}
-
-// runVPNIPCheck probes an IP-echo service through the VPN interface and
-// stores the detected exit IP in state.
-func (m *Manager) runVPNIPCheck(ctx context.Context) {
-	ip, err := m.checker.DetectExitIP(ctx, m.cfg.VPNInterface)
-	if err != nil {
-		log.Printf("vpn ip check: %v", err)
-		return
-	}
-	m.mu.Lock()
-	m.state.VPNExitIP = ip
-	m.state.VPNExitIPAt = time.Now().UTC().Format(time.RFC3339)
-	saveErr := m.saveStateLocked()
-	m.mu.Unlock()
-	if saveErr != nil {
-		log.Printf("warn: save state after vpn ip check: %v", saveErr)
-	}
-	log.Printf("vpn exit ip: %s", ip)
-}
-
-// StartVPNIPChecker starts the periodic VPN exit IP detection goroutine.
-func (m *Manager) StartVPNIPChecker(ctx context.Context) {
-	if m.checker == nil || m.cfg.VPNIPCheckInterval <= 0 {
-		return
-	}
-	go func() {
-		m.runVPNIPCheck(ctx)
-		t := time.NewTicker(m.cfg.VPNIPCheckInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				m.runVPNIPCheck(ctx)
 			}
 		}
 	}()
@@ -766,17 +622,7 @@ func tsInWindow(tsStr string, window time.Duration) bool {
 
 // ── HTTP handler ──────────────────────────────────────────────────────────────
 
-const (
-	apiPath    = "/api/v1/routes"
-	statusPath = "/api/v1/status"
-)
-
-type statusResponse struct {
-	VPNExitIP   string `json:"vpn_exit_ip,omitempty"`
-	VPNExitIPAt string `json:"vpn_exit_ip_at,omitempty"`
-	VPNRoutes   int    `json:"vpn_routes"`
-	ISPRoutes   int    `json:"isp_routes"`
-}
+const apiPath = "/api/v1/routes"
 
 type pushPayload struct {
 	VPN []string `json:"vpn"`
@@ -806,19 +652,6 @@ func NewHandler(cfg Config, mgr *Manager) http.Handler {
 	rl := newRateLimiter(cfg.RateLimitMax)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == statusPath && r.Method == http.MethodGet {
-			mgr.mu.Lock()
-			s := mgr.state
-			mgr.mu.Unlock()
-			jsonResp(w, http.StatusOK, statusResponse{
-				VPNExitIP:   s.VPNExitIP,
-				VPNExitIPAt: s.VPNExitIPAt,
-				VPNRoutes:   s.VPNRouteCount,
-				ISPRoutes:   s.ISPRouteCount,
-			})
-			return
-		}
-
 		if r.URL.Path != apiPath || r.Method != http.MethodPost {
 			errResp(w, http.StatusNotFound, "not found")
 			return
@@ -901,10 +734,6 @@ func main() {
 	exec := systemExecutor{}
 	res := newNetResolver()
 	mgr := NewManager(cfg, exec, res)
-	if cfg.VPNIPCheckEnabled {
-		mgr.checker = netChecker{}
-		log.Printf("vpn ip check enabled (interval: %v, %d probe urls)", cfg.VPNIPCheckInterval, len(probeCheckURLs))
-	}
 
 	if err := mgr.EnsureFiles(); err != nil {
 		log.Fatalf("ensure files: %v", err)
@@ -915,7 +744,6 @@ func main() {
 	defer cancel()
 
 	mgr.StartRefresher(ctx)
-	mgr.StartVPNIPChecker(ctx)
 
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,

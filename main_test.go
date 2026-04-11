@@ -2,12 +2,10 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -54,26 +52,6 @@ func (f *fakeExecutor) ConfigureCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.configureCnt
-}
-
-type fakeChecker struct {
-	mu  sync.Mutex
-	ip  string
-	err error
-	cnt int
-}
-
-func (f *fakeChecker) DetectExitIP(_ context.Context, _ string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.cnt++
-	return f.ip, f.err
-}
-
-func (f *fakeChecker) CallCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.cnt
 }
 
 type fakeResolver struct {
@@ -970,20 +948,19 @@ func TestListInterfaces(t *testing.T) {
 	}
 }
 
-// ── VPN IP checker tests ──────────────────────────────────────────────────────
+// ── IP check sites tests ──────────────────────────────────────────────────────
 
-// TestVPNIPCheckProbeDomainsInISPList verifies that when VPN IP check is enabled,
-// probe domains are resolved and appended to the ISP route file.
-func TestVPNIPCheckProbeDomainsInISPList(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.VPNIPCheckEnabled = true
-	exec := &fakeExecutor{}
-	res := newFakeResolver()
-	for i, d := range probeCheckDomains {
-		res.domains[d] = []string{fmt.Sprintf("10.99.0.%d", i+1)}
+// TestIPCheckSitesInISPList verifies that domains in ip-check-sites.list are
+// resolved and appended to the ISP route file on every apply.
+func TestIPCheckSitesInISPList(t *testing.T) {
+	mgr, _, res := newTestManager(t)
+	res.domains["probe1.example"] = []string{"10.99.0.1"}
+	res.domains["probe2.example"] = []string{"10.99.0.2"}
+
+	sitesFile := filepath.Join(mgr.cfg.WorkDir, "ip-check-sites.list")
+	if err := os.WriteFile(sitesFile, []byte("# comment\nprobe1.example\nprobe2.example\n"), 0o644); err != nil {
+		t.Fatalf("write sites file: %v", err)
 	}
-	mgr := NewManager(cfg, exec, res)
-	_ = mgr.EnsureFiles()
 
 	_, _, err := mgr.Update([]string{}, []string{})
 	if err != nil {
@@ -991,185 +968,24 @@ func TestVPNIPCheckProbeDomainsInISPList(t *testing.T) {
 	}
 
 	data, _ := os.ReadFile(mgr.ispListPath())
-	for i, d := range probeCheckDomains {
-		want := fmt.Sprintf("10.99.0.%d/32", i+1)
+	for _, want := range []string{"10.99.0.1/32", "10.99.0.2/32"} {
 		if !strings.Contains(string(data), want) {
-			t.Errorf("probe domain %s: expected %s in isp list, got:\n%s", d, want, data)
+			t.Errorf("expected %s in isp list, got:\n%s", want, data)
 		}
 	}
 }
 
-// TestVPNIPCheckDisabledNoProbeDomains verifies that probe domains are NOT added
-// to the ISP list when VPN IP check is disabled.
-func TestVPNIPCheckDisabledNoProbeDomains(t *testing.T) {
-	cfg := testConfig(t) // VPNIPCheckEnabled=false by default
-	exec := &fakeExecutor{}
-	res := newFakeResolver()
-	for i, d := range probeCheckDomains {
-		res.domains[d] = []string{fmt.Sprintf("10.99.0.%d", i+1)}
-	}
-	mgr := NewManager(cfg, exec, res)
-	_ = mgr.EnsureFiles()
+// TestIPCheckSitesMissingFileIsNoop verifies that a missing ip-check-sites.list
+// does not affect behaviour.
+func TestIPCheckSitesMissingFileIsNoop(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	// No ip-check-sites.list written — WorkDir is a fresh temp dir.
 
 	_, ispN, err := mgr.Update([]string{}, []string{})
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if ispN != 0 {
-		t.Errorf("expected 0 isp routes when disabled, got %d", ispN)
-	}
-	data, _ := os.ReadFile(mgr.ispListPath())
-	if strings.Contains(string(data), "10.99.0.") {
-		t.Errorf("probe domain IPs leaked into isp list when disabled:\n%s", data)
-	}
-}
-
-// TestVPNIPCheckRunSuccess verifies that a successful check updates state.
-func TestVPNIPCheckRunSuccess(t *testing.T) {
-	mgr, _, _ := newTestManager(t)
-	mgr.checker = &fakeChecker{ip: "5.6.7.8"}
-
-	mgr.runVPNIPCheck(context.Background())
-
-	mgr.mu.Lock()
-	ip := mgr.state.VPNExitIP
-	at := mgr.state.VPNExitIPAt
-	mgr.mu.Unlock()
-
-	if ip != "5.6.7.8" {
-		t.Errorf("expected VPNExitIP=5.6.7.8, got %q", ip)
-	}
-	if at == "" {
-		t.Error("expected VPNExitIPAt to be set")
-	}
-}
-
-// TestVPNIPCheckRunError verifies that a failed check does not corrupt state.
-func TestVPNIPCheckRunError(t *testing.T) {
-	mgr, _, _ := newTestManager(t)
-	mgr.checker = &fakeChecker{err: errors.New("vpn interface down")}
-
-	mgr.runVPNIPCheck(context.Background())
-
-	mgr.mu.Lock()
-	ip := mgr.state.VPNExitIP
-	mgr.mu.Unlock()
-
-	if ip != "" {
-		t.Errorf("expected empty VPNExitIP after error, got %q", ip)
-	}
-}
-
-// TestVPNIPCheckPreservedAcrossPush verifies that a detected VPN exit IP
-// survives a subsequent route push.
-func TestVPNIPCheckPreservedAcrossPush(t *testing.T) {
-	mgr, _, _ := newTestManager(t)
-	mgr.checker = &fakeChecker{ip: "9.9.9.9"}
-	mgr.runVPNIPCheck(context.Background())
-
-	_, _, err := mgr.Update([]string{"1.2.3.4"}, []string{})
-	if err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-
-	mgr.mu.Lock()
-	ip := mgr.state.VPNExitIP
-	mgr.mu.Unlock()
-
-	if ip != "9.9.9.9" {
-		t.Errorf("VPNExitIP lost after push: got %q, want 9.9.9.9", ip)
-	}
-}
-
-// ── Status endpoint tests ─────────────────────────────────────────────────────
-
-func TestStatusEndpointEmpty(t *testing.T) {
-	srv, _, _ := newTestServer(t)
-
-	resp, err := http.Get(srv.URL + statusPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
-	var sr statusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if sr.VPNExitIP != "" {
-		t.Errorf("expected empty vpn_exit_ip, got %q", sr.VPNExitIP)
-	}
-	if sr.VPNRoutes != 0 || sr.ISPRoutes != 0 {
-		t.Errorf("expected zero route counts, got vpn=%d isp=%d", sr.VPNRoutes, sr.ISPRoutes)
-	}
-}
-
-func TestStatusEndpointWithExitIP(t *testing.T) {
-	mgr, _, _ := newTestManager(t)
-	mgr.checker = &fakeChecker{ip: "5.6.7.8"}
-	mgr.runVPNIPCheck(context.Background())
-
-	srv := httptest.NewServer(NewHandler(mgr.cfg, mgr))
-	t.Cleanup(srv.Close)
-
-	resp, err := http.Get(srv.URL + statusPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	var sr statusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if sr.VPNExitIP != "5.6.7.8" {
-		t.Errorf("expected vpn_exit_ip=5.6.7.8, got %q", sr.VPNExitIP)
-	}
-	if sr.VPNExitIPAt == "" {
-		t.Error("expected vpn_exit_ip_at to be set")
-	}
-}
-
-func TestStatusEndpointReflectsRoutes(t *testing.T) {
-	srv, _, _ := newTestServer(t)
-
-	doPost(t, srv, "test-secret-token", pushPayload{
-		VPN: []string{"10.0.0.0/8"},
-		ISP: []string{"192.0.2.0/24"},
-	}).Body.Close()
-
-	resp, err := http.Get(srv.URL + statusPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	var sr statusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if sr.VPNRoutes == 0 {
-		t.Error("expected non-zero vpn_routes after push")
-	}
-	if sr.ISPRoutes != 1 {
-		t.Errorf("expected 1 isp_route, got %d", sr.ISPRoutes)
-	}
-}
-
-// TestStatusEndpointMethodNotAllowed verifies non-GET on /status returns 404
-// (consistent with the existing policy of not revealing path existence).
-func TestStatusEndpointMethodNotAllowed(t *testing.T) {
-	srv, _, _ := newTestServer(t)
-
-	resp, err := http.Post(srv.URL+statusPath, "application/json", strings.NewReader("{}"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("expected 404 for POST on status, got %d", resp.StatusCode)
+		t.Errorf("expected 0 isp routes, got %d", ispN)
 	}
 }

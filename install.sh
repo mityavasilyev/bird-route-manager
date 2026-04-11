@@ -340,43 +340,6 @@ else
 fi
 ok "Refresh interval: every ${REFRESH_HOURS}h"
 
-echo ""
-
-# ── VPN exit IP detection ──
-
-note "When enabled, the service periodically probes an IP-echo service"
-note "through the VPN interface to detect and record the VPN exit IP."
-note "Probe domains are auto-added to ISP routes so they stay reachable via ISP."
-echo ""
-
-CURRENT_IP_CHECK=$(env_get "VPN_IP_CHECK_ENABLED" "false")
-CURRENT_IP_CHECK_HOURS=$(env_get "VPN_IP_CHECK_INTERVAL_HOURS" "6")
-CHANGE_IP_CHECK=true
-
-if $REINSTALL; then
-    if [[ "$CURRENT_IP_CHECK" == "true" ]]; then
-        echo -e "  VPN exit IP detection: ${CYAN}enabled${RESET} (every ${CURRENT_IP_CHECK_HOURS}h)"
-    else
-        echo -e "  VPN exit IP detection: ${DIM}disabled${RESET}"
-    fi
-    ask_yn "Change it?" n && CHANGE_IP_CHECK=true || CHANGE_IP_CHECK=false
-fi
-
-VPN_IP_CHECK_ENABLED="$CURRENT_IP_CHECK"
-VPN_IP_CHECK_INTERVAL_HOURS="$CURRENT_IP_CHECK_HOURS"
-
-if $CHANGE_IP_CHECK; then
-    if ask_yn "Enable VPN exit IP detection?" n; then
-        VPN_IP_CHECK_ENABLED="true"
-        VPN_IP_CHECK_INTERVAL_HOURS=$(ask "Re-detect every N hours" "$CURRENT_IP_CHECK_HOURS")
-        VPN_IP_CHECK_INTERVAL_HOURS="${VPN_IP_CHECK_INTERVAL_HOURS:-6}"
-        ok "VPN exit IP detection: enabled (every ${VPN_IP_CHECK_INTERVAL_HOURS}h)"
-    else
-        VPN_IP_CHECK_ENABLED="false"
-        ok "VPN exit IP detection: disabled"
-    fi
-fi
-
 # ─────────────────────────────────────────────────────────────────────────────
 # [5/6] Applying
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,6 +392,16 @@ touch -a "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 chmod 644 "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 ok "Route list files ready"
 
+# 5c2 — IP check sites list (domains always routed via ISP)
+# Only install if not already present so local edits are not overwritten on re-run.
+IP_CHECK_SITES="$WORK_DIR/ip-check-sites.list"
+if [[ ! -f "$IP_CHECK_SITES" ]]; then
+    install -m 644 "$SCRIPT_DIR/ip-check-sites.list" "$IP_CHECK_SITES"
+    ok "Installed ip-check-sites.list"
+else
+    ok "ip-check-sites.list already present (not overwritten)"
+fi
+
 # 5d — Env file
 [[ -f "$ENV_FILE" ]] || touch "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -439,10 +412,8 @@ env_set "BGP_PEER_IP"   "$BGP_PEER_IP"
 env_set "BGP_PEER_AS"   "$BGP_PEER_AS"
 env_set "BGP_LOCAL_AS"  "$BGP_LOCAL_AS"
 env_set "BGP_NEXTHOP"   "$BGP_NEXTHOP"
-env_set "REFRESH_HOURS"             "$REFRESH_HOURS"
-env_set "VPN_IP_CHECK_ENABLED"      "$VPN_IP_CHECK_ENABLED"
-env_set "VPN_IP_CHECK_INTERVAL_HOURS" "$VPN_IP_CHECK_INTERVAL_HOURS"
-env_set "WORK_DIR"                  "$WORK_DIR"
+env_set "REFRESH_HOURS" "$REFRESH_HOURS"
+env_set "WORK_DIR"      "$WORK_DIR"
 
 if $ENABLE_API && [[ -n "$NEW_TOKEN" ]]; then
     env_set "SYNC_TOKEN" "$NEW_TOKEN"
@@ -669,14 +640,6 @@ else
     note "Check: journalctl -u bird-route-manager --no-pager -n 20"
 fi
 
-# Verify status endpoint
-STATUS_CODE=$(curl -sf --max-time 3 -o /dev/null -w "%{http_code}" \
-    http://127.0.0.1:8081/api/v1/status 2>/dev/null || echo "000")
-if [[ "$STATUS_CODE" == "200" ]]; then
-    ok "Status endpoint is up (GET /api/v1/status → 200)"
-else
-    warn "Status endpoint did not respond (got HTTP $STATUS_CODE)"
-fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
@@ -688,11 +651,6 @@ echo ""
 echo -e "  VPN interface:  ${CYAN}$VPN_INTERFACE${RESET}"
 echo -e "  BGP feed:       ${CYAN}$BGP_PEER_IP AS$BGP_PEER_AS${RESET}"
 echo -e "  Refresh:        ${CYAN}every ${REFRESH_HOURS}h${RESET}"
-if [[ "$VPN_IP_CHECK_ENABLED" == "true" ]]; then
-    echo -e "  Exit IP detect: ${CYAN}every ${VPN_IP_CHECK_INTERVAL_HOURS}h${RESET} (GET /api/v1/status)"
-else
-    echo -e "  Exit IP detect: ${DIM}disabled${RESET}"
-fi
 echo -e "  Config:         ${CYAN}$ENV_FILE${RESET}"
 
 FINAL_TOKEN=$(env_get "SYNC_TOKEN" "")
