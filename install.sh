@@ -392,14 +392,22 @@ touch -a "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 chmod 644 "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 ok "Route list files ready"
 
-# 5c2 — IP check sites list (domains always routed via ISP)
-# Only install if not already present so local edits are not overwritten on re-run.
+# 5c2 — IP check sites list (optional: route IP-echo domains via ISP)
 IP_CHECK_SITES="$WORK_DIR/ip-check-sites.list"
-if [[ ! -f "$IP_CHECK_SITES" ]]; then
-    install -m 644 "$SCRIPT_DIR/ip-check-sites.list" "$IP_CHECK_SITES"
-    ok "Installed ip-check-sites.list"
-else
+if [[ -f "$IP_CHECK_SITES" ]]; then
     ok "ip-check-sites.list already present (not overwritten)"
+else
+    echo ""
+    note "IP-check sites routing: resolves IP-echo service domains (ifconfig.me etc.)"
+    note "and forces their IPs via ISP so they never route through the VPN."
+    note "Disable if you intentionally want those sites to go through the VPN."
+    echo ""
+    if ask_yn "Route IP-check sites via ISP?" y; then
+        install -m 644 "$SCRIPT_DIR/ip-check-sites.list" "$IP_CHECK_SITES"
+        ok "Installed ip-check-sites.list"
+    else
+        ok "Skipped — IP-check sites will follow normal routing"
+    fi
 fi
 
 # 5d — Env file
