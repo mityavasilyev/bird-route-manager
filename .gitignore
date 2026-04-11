@@ -1,0 +1,15 @@
+# Build output
+bird-route-manager
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go test cache
+*.test
+*.out
