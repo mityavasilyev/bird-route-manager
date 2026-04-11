@@ -340,6 +340,38 @@ else
 fi
 ok "Refresh interval: every ${REFRESH_HOURS}h"
 
+echo ""
+
+# ── IP-check sites routing ──
+
+note "Resolves IP-echo service domains (ifconfig.me, ipinfo.io, etc.) and"
+note "routes their IPs via ISP so they are never sent through the VPN."
+note "Disable only if you intentionally want those sites to go through the VPN."
+echo ""
+
+IP_CHECK_SITES="$WORK_DIR/ip-check-sites.list"
+CURRENT_IP_SITES_ENABLED=false
+[[ -f "$IP_CHECK_SITES" ]] && CURRENT_IP_SITES_ENABLED=true
+CHANGE_IP_SITES=true
+
+if $REINSTALL; then
+    $CURRENT_IP_SITES_ENABLED \
+        && echo -e "  IP-check sites routing: ${CYAN}enabled${RESET}" \
+        || echo -e "  IP-check sites routing: ${DIM}disabled${RESET}"
+    ask_yn "Change it?" n && CHANGE_IP_SITES=true || CHANGE_IP_SITES=false
+fi
+
+INSTALL_IP_CHECK_SITES=$CURRENT_IP_SITES_ENABLED
+if $CHANGE_IP_SITES; then
+    if ask_yn "Route IP-check sites via ISP?" y; then
+        INSTALL_IP_CHECK_SITES=true
+        ok "IP-check sites routing: enabled"
+    else
+        INSTALL_IP_CHECK_SITES=false
+        ok "IP-check sites routing: disabled"
+    fi
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # [5/6] Applying
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,22 +424,13 @@ touch -a "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 chmod 644 "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 ok "Route list files ready"
 
-# 5c2 — IP check sites list (optional: route IP-echo domains via ISP)
-IP_CHECK_SITES="$WORK_DIR/ip-check-sites.list"
-if [[ -f "$IP_CHECK_SITES" ]]; then
-    ok "ip-check-sites.list already present (not overwritten)"
+# 5c2 — IP check sites list
+if $INSTALL_IP_CHECK_SITES; then
+    install -m 644 "$SCRIPT_DIR/ip-check-sites.list" "$IP_CHECK_SITES"
+    ok "ip-check-sites.list installed"
 else
-    echo ""
-    note "IP-check sites routing: resolves IP-echo service domains (ifconfig.me etc.)"
-    note "and forces their IPs via ISP so they never route through the VPN."
-    note "Disable if you intentionally want those sites to go through the VPN."
-    echo ""
-    if ask_yn "Route IP-check sites via ISP?" y; then
-        install -m 644 "$SCRIPT_DIR/ip-check-sites.list" "$IP_CHECK_SITES"
-        ok "Installed ip-check-sites.list"
-    else
-        ok "Skipped — IP-check sites will follow normal routing"
-    fi
+    rm -f "$IP_CHECK_SITES"
+    ok "ip-check-sites.list removed"
 fi
 
 # 5d — Env file
@@ -636,10 +659,10 @@ else
 fi
 
 # Verify bird-route-manager HTTP API
-HTTP_CODE=$(curl -sf --max-time 3 -o /dev/null -w "%{http_code}" \
+HTTP_CODE=$(curl -s --max-time 3 -o /dev/null -w "%{http_code}" \
     -X POST http://127.0.0.1:8081/api/v1/routes \
     -H "Content-Type: application/json" \
-    -d '{}' 2>/dev/null || echo "000")
+    -d '{}' 2>/dev/null || true)
 
 if [[ "$HTTP_CODE" =~ ^(401|503)$ ]]; then
     ok "bird-route-manager API is up (HTTP $HTTP_CODE as expected)"
