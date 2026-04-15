@@ -3,7 +3,7 @@
 #
 # Installs and configures on a fresh Ubuntu VPS:
 #   • Go toolchain (if not already present)
-#   • BIRD2 routing daemon with antifilter BGP split-routing
+#   • BIRD2 routing daemon with BGP split-routing (re:filter by default)
 #   • bird-route-manager service (user-defined route lists + push API)
 #
 # Prerequisites (do these before running this script):
@@ -241,11 +241,11 @@ hdr "3/6" "Route feed (BGP)"
 echo ""
 
 note "BIRD2 connects to a BGP server to receive the list of IPs that should"
-note "be routed via your VPN. For antifilter.download, keep all defaults."
+note "be routed via your VPN. For re:filter, keep all defaults."
 echo ""
 
-CURRENT_BGP_PEER=$(env_get "BGP_PEER_IP"  "45.154.73.71")
-CURRENT_BGP_AS=$(env_get   "BGP_PEER_AS"  "65432")
+CURRENT_BGP_PEER=$(env_get "BGP_PEER_IP"  "165.22.127.207")
+CURRENT_BGP_AS=$(env_get   "BGP_PEER_AS"  "65412")
 CURRENT_LOCAL_AS=$(env_get "BGP_LOCAL_AS" "64999")
 CURRENT_BGP_NH=$(env_get   "BGP_NEXTHOP"  "10.8.1.1")
 CHANGE_BGP=false
@@ -254,7 +254,7 @@ if $REINSTALL; then
     echo -e "  Current feed: ${CYAN}${CURRENT_BGP_PEER} AS${CURRENT_BGP_AS}${RESET}"
     ask_yn "Change BGP settings?" n && CHANGE_BGP=true || CHANGE_BGP=false
 else
-    ask_yn "Using antifilter.download? (keep defaults)" y \
+    ask_yn "Using re:filter? (keep defaults)" y \
         && CHANGE_BGP=false \
         || CHANGE_BGP=true
 fi
@@ -275,7 +275,7 @@ else
     BGP_PEER_AS="$CURRENT_BGP_AS"
     BGP_LOCAL_AS="$CURRENT_LOCAL_AS"
     BGP_NEXTHOP="$CURRENT_BGP_NH"
-    ok "Using antifilter.download defaults"
+    ok "Using re:filter defaults"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,7 +500,7 @@ protocol static vpn_nexthop {
 protocol kernel {
     ipv4 {
         export filter {
-            if proto = "antifilter" then accept;
+            if proto = "bgp_feed" then accept;
             if proto = "user_vpn"   then accept;
             if proto = "user_isp"   then accept;
             reject;
@@ -508,7 +508,7 @@ protocol kernel {
     };
 }
 
-protocol bgp antifilter {
+protocol bgp bgp_feed {
     local as ${BGP_LOCAL_AS};
     neighbor ${BGP_PEER_IP} as ${BGP_PEER_AS};
     multihop;
@@ -644,7 +644,7 @@ echo ""
 echo "  Waiting for BGP session to establish..."
 BGP_STATE=""
 for i in $(seq 1 30); do
-    BGP_STATE=$(birdc show protocols antifilter 2>/dev/null | awk '/antifilter/{print $6}')
+    BGP_STATE=$(birdc show protocols bgp_feed 2>/dev/null | awk '/bgp_feed/{print $6}')
     [[ "$BGP_STATE" == "Established" ]] && break
     sleep 1
 done
@@ -655,7 +655,7 @@ if [[ "$BGP_STATE" == "Established" ]]; then
 else
     warn "BGP not yet Established (state: ${BGP_STATE:-unknown})"
     note "This is normal if the tunnel was just brought up — it may take a minute."
-    note "Check later: birdc show protocols antifilter"
+    note "Check later: birdc show protocols bgp_feed"
 fi
 
 # Verify bird-route-manager HTTP API
