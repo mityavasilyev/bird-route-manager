@@ -36,7 +36,7 @@ sudo ./install.sh
 
 1. Installs Go and BIRD2 if not present
 2. Asks which VPN interface to use (lists what's available)
-3. Asks for the BGP peer (defaults to re:filter)
+3. Asks for the BGP peer (defaults to antifilter.network)
 4. Optionally enables the push API and generates a token
 5. Writes a full `bird.conf`, builds the binary, installs the systemd service
 6. Verifies the BGP session is established before exiting
