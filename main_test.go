@@ -27,6 +27,8 @@ type fakeExecutor struct {
 	gwErr        error
 	configureErr error
 	configureCnt int
+	ipsetIPs     []string // IPs returned by ReadIPSet
+	ipsetErr     error
 }
 
 func (f *fakeExecutor) DefaultGW() (string, error) {
@@ -52,6 +54,15 @@ func (f *fakeExecutor) ConfigureCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.configureCnt
+}
+
+func (f *fakeExecutor) ReadIPSet(name string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ipsetErr != nil {
+		return nil, f.ipsetErr
+	}
+	return f.ipsetIPs, nil
 }
 
 type fakeResolver struct {
@@ -935,6 +946,159 @@ func TestResponseDoesNotLeakServerInfo(t *testing.T) {
 }
 
 // ── Network interface sanity ──────────────────────────────────────────────────
+
+// ── dnsmasq ipset layer tests ────────────────────────────────────────────────
+
+func TestParseIPSetSave(t *testing.T) {
+	input := `create ru_domains hash:ip family inet hashsize 1024 maxelem 65536 timeout 21600
+add ru_domains 93.158.134.3 timeout 18432
+add ru_domains 77.88.55.88 timeout 21100
+add ru_domains 5.255.255.5 timeout 3600
+add ru_domains not-an-ip timeout 100
+`
+	got := parseIPSetSave(input)
+	want := map[string]bool{
+		"93.158.134.3/32": true,
+		"77.88.55.88/32":  true,
+		"5.255.255.5/32":  true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parseIPSetSave: got %d entries, want %d: %v", len(got), len(want), got)
+	}
+	for _, ip := range got {
+		if !want[ip] {
+			t.Errorf("unexpected entry %q", ip)
+		}
+	}
+}
+
+func TestParseIPSetSaveEmpty(t *testing.T) {
+	got := parseIPSetSave("")
+	if len(got) != 0 {
+		t.Errorf("expected empty result, got %v", got)
+	}
+}
+
+func TestParseIPSetSaveDedup(t *testing.T) {
+	input := "add s 1.2.3.4 timeout 100\nadd s 1.2.3.4 timeout 200\n"
+	got := parseIPSetSave(input)
+	if len(got) != 1 {
+		t.Errorf("expected 1 entry after dedup, got %d: %v", len(got), got)
+	}
+}
+
+func TestDNSMasqIPSetApply(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.DNSMasqIPSet = "ru_domains"
+	exec := &fakeExecutor{
+		ipsetIPs: []string{"93.158.134.3/32", "77.88.55.88/32"},
+	}
+	res := newFakeResolver()
+	mgr := NewManager(cfg, exec, res)
+	if err := mgr.EnsureFiles(); err != nil {
+		t.Fatalf("EnsureFiles: %v", err)
+	}
+
+	_, _, err := mgr.Update([]string{}, []string{})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// dnsmasq-isp.list should contain the ipset IPs with ISP gateway
+	data, err := os.ReadFile(mgr.dnsmasqIspListPath())
+	if err != nil {
+		t.Fatalf("read dnsmasq isp list: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{"93.158.134.3/32", "77.88.55.88/32"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("dnsmasq-isp.list missing %s, got:\n%s", want, content)
+		}
+	}
+	// Must use ISP gateway, not VPN interface
+	if strings.Contains(content, `"wg-test"`) {
+		t.Error("dnsmasq-isp.list should use ISP gateway, not VPN interface")
+	}
+	if !strings.Contains(content, "10.0.0.1") {
+		t.Error("dnsmasq-isp.list missing ISP gateway 10.0.0.1")
+	}
+}
+
+func TestDNSMasqIPSetDisabled(t *testing.T) {
+	mgr, _, _ := newTestManager(t)
+	// DNSMasqIPSet is empty by default in testConfig
+
+	_, _, err := mgr.Update([]string{}, []string{})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// dnsmasq-isp.list should NOT be created when feature is disabled
+	if _, err := os.Stat(mgr.dnsmasqIspListPath()); !os.IsNotExist(err) {
+		t.Error("dnsmasq-isp.list should not exist when feature is disabled")
+	}
+}
+
+func TestDNSMasqIPSetEmptySet(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.DNSMasqIPSet = "ru_domains"
+	exec := &fakeExecutor{ipsetIPs: nil} // empty ipset
+	res := newFakeResolver()
+	mgr := NewManager(cfg, exec, res)
+	_ = mgr.EnsureFiles()
+
+	_, _, err := mgr.Update([]string{}, []string{})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	data, _ := os.ReadFile(mgr.dnsmasqIspListPath())
+	if strings.Contains(string(data), "route ") {
+		t.Errorf("dnsmasq-isp.list should be empty for empty ipset, got:\n%s", data)
+	}
+}
+
+func TestDNSMasqIPSetReadError(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.DNSMasqIPSet = "ru_domains"
+	exec := &fakeExecutor{ipsetErr: fmt.Errorf("ipset: set not found")}
+	res := newFakeResolver()
+	mgr := NewManager(cfg, exec, res)
+	_ = mgr.EnsureFiles()
+
+	// Should not fail — ipset read errors are non-fatal (logged as warning)
+	_, _, err := mgr.Update([]string{}, []string{})
+	if err != nil {
+		t.Fatalf("Update should not fail on ipset read error: %v", err)
+	}
+}
+
+func TestDNSMasqIPSetRefresh(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.DNSMasqIPSet = "ru_domains"
+	exec := &fakeExecutor{
+		ipsetIPs: []string{"1.1.1.1/32"},
+	}
+	res := newFakeResolver()
+	mgr := NewManager(cfg, exec, res)
+	_ = mgr.EnsureFiles()
+
+	// Initial update
+	_, _, _ = mgr.Update([]string{"example.com"}, nil)
+
+	// Simulate ipset change
+	exec.mu.Lock()
+	exec.ipsetIPs = []string{"1.1.1.1/32", "2.2.2.2/32"}
+	exec.mu.Unlock()
+
+	// Refresh should pick up new IPs
+	mgr.Refresh()
+
+	data, _ := os.ReadFile(mgr.dnsmasqIspListPath())
+	if !strings.Contains(string(data), "2.2.2.2/32") {
+		t.Errorf("dnsmasq-isp.list not updated after refresh:\n%s", data)
+	}
+}
 
 // TestListInterfaces verifies we can list network interfaces (used by setup.sh).
 // This just checks the Go stdlib call works, not actual interface names.

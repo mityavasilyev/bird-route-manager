@@ -41,6 +41,9 @@ import (
 type Executor interface {
 	DefaultGW() (string, error)
 	BirdConfigure() error
+	// ReadIPSet returns the IPv4 members of a kernel ipset.
+	// Returns nil, nil if the ipset does not exist or is empty.
+	ReadIPSet(name string) ([]string, error)
 }
 
 // Resolver abstracts DNS and ASN lookups.
@@ -80,6 +83,12 @@ type Config struct {
 
 	// MaxBodyBytes is the hard cap on request body size.
 	MaxBodyBytes int64
+
+	// DNSMasqIPSet is the name of a kernel ipset populated by dnsmasq for
+	// TLD-based ISP routing (e.g. all .ru domains). If empty, the feature is
+	// disabled. When set, bird-route-manager reads the ipset on every apply/refresh
+	// and writes a separate BIRD2 route file (dnsmasq-isp.list) with preference 150.
+	DNSMasqIPSet string
 }
 
 func configFromEnv() Config {
@@ -92,6 +101,7 @@ func configFromEnv() Config {
 		TimestampWindow: time.Duration(envOrInt("TIMESTAMP_WINDOW", 300)) * time.Second,
 		RateLimitMax:    envOrInt("RATE_LIMIT_MAX", 5),
 		MaxBodyBytes:    64 * 1024,
+		DNSMasqIPSet:    os.Getenv("DNSMASQ_IPSET"),
 	}
 }
 
@@ -349,6 +359,47 @@ func (systemExecutor) BirdConfigure() error {
 	return nil
 }
 
+// ReadIPSet dumps a kernel ipset and returns its IPv4 members as /32 CIDRs.
+// Uses `ipset list <name> -output save` which outputs lines like:
+//
+//	add <name> <ip> timeout <n>
+//
+// Returns nil, nil if the ipset does not exist.
+func (systemExecutor) ReadIPSet(name string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ipset", "list", name, "-output", "save").Output()
+	if err != nil {
+		// ipset exits non-zero if the set doesn't exist — treat as empty
+		return nil, nil
+	}
+	return parseIPSetSave(string(out)), nil
+}
+
+// parseIPSetSave extracts IPv4 addresses from `ipset list -output save` output.
+func parseIPSetSave(output string) []string {
+	var ips []string
+	seen := make(map[string]struct{})
+	for line := range strings.SplitSeq(output, "\n") {
+		// Lines look like: "add setname 1.2.3.4 timeout 12345"
+		// or without timeout: "add setname 1.2.3.4"
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[0] != "add" {
+			continue
+		}
+		ip := fields[2]
+		if net.ParseIP(ip) == nil || net.ParseIP(ip).To4() == nil {
+			continue
+		}
+		cidr := ip + "/32"
+		if _, dup := seen[cidr]; !dup {
+			seen[cidr] = struct{}{}
+			ips = append(ips, cidr)
+		}
+	}
+	return ips
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 // State holds the raw (pre-resolution) entry lists and is persisted to disk.
@@ -375,9 +426,10 @@ func NewManager(cfg Config, exec Executor, res Resolver) *Manager {
 	return &Manager{cfg: cfg, exec: exec, res: res}
 }
 
-func (m *Manager) vpnListPath() string { return filepath.Join(m.cfg.WorkDir, "user-vpn.list") }
-func (m *Manager) ispListPath() string { return filepath.Join(m.cfg.WorkDir, "user-isp.list") }
-func (m *Manager) statePath() string   { return filepath.Join(m.cfg.WorkDir, "state.json") }
+func (m *Manager) vpnListPath() string       { return filepath.Join(m.cfg.WorkDir, "user-vpn.list") }
+func (m *Manager) ispListPath() string       { return filepath.Join(m.cfg.WorkDir, "user-isp.list") }
+func (m *Manager) dnsmasqIspListPath() string { return filepath.Join(m.cfg.WorkDir, "dnsmasq-isp.list") }
+func (m *Manager) statePath() string          { return filepath.Join(m.cfg.WorkDir, "state.json") }
 
 // vpnNexthop returns the BIRD2 nexthop string for the VPN interface.
 // BIRD2 uses a quoted string to mean "resolve via this interface".
@@ -386,7 +438,11 @@ func (m *Manager) vpnNexthop() string { return fmt.Sprintf("%q", m.cfg.VPNInterf
 // EnsureFiles creates empty list files if they do not exist, so BIRD2's
 // `include` directive never fails on a fresh install.
 func (m *Manager) EnsureFiles() error {
-	for _, p := range []string{m.vpnListPath(), m.ispListPath()} {
+	paths := []string{m.vpnListPath(), m.ispListPath()}
+	if m.cfg.DNSMasqIPSet != "" {
+		paths = append(paths, m.dnsmasqIspListPath())
+	}
+	for _, p := range paths {
 		if _, err := os.Stat(p); os.IsNotExist(err) {
 			if err := atomicWrite(p, ""); err != nil {
 				return fmt.Errorf("create %s: %w", p, err)
@@ -515,6 +571,19 @@ func (m *Manager) applyLocked(vpn, isp []string) (vpnCIDRs, ispCIDRs []string, e
 	}
 	if err := atomicWrite(m.ispListPath(), routeFileContent(ispCIDRs, gw)); err != nil {
 		return nil, nil, fmt.Errorf("write isp list: %w", err)
+	}
+
+	// dnsmasq ipset layer: read kernel ipset and write a separate route file.
+	// This runs on every apply/refresh so the route file tracks ipset changes.
+	if m.cfg.DNSMasqIPSet != "" {
+		dnsmasqCIDRs, readErr := m.exec.ReadIPSet(m.cfg.DNSMasqIPSet)
+		if readErr != nil {
+			log.Printf("warn: read ipset %s: %v", m.cfg.DNSMasqIPSet, readErr)
+		}
+		if writeErr := atomicWrite(m.dnsmasqIspListPath(), routeFileContent(dnsmasqCIDRs, gw)); writeErr != nil {
+			return nil, nil, fmt.Errorf("write dnsmasq isp list: %w", writeErr)
+		}
+		log.Printf("dnsmasq ipset: %d IPs from %s", len(dnsmasqCIDRs), m.cfg.DNSMasqIPSet)
 	}
 
 	if err := m.exec.BirdConfigure(); err != nil {
@@ -762,6 +831,9 @@ func main() {
 
 	if cfg.Token == "" {
 		log.Println("SYNC_TOKEN not set — push API disabled (run setup.sh to enable)")
+	}
+	if cfg.DNSMasqIPSet != "" {
+		log.Printf("dnsmasq ipset layer enabled: reading from ipset %q", cfg.DNSMasqIPSet)
 	}
 	log.Printf("listening on %s (work dir: %s, vpn interface: %s, refresh: %v)",
 		cfg.ListenAddr, cfg.WorkDir, cfg.VPNInterface, cfg.RefreshInterval)

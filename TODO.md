@@ -32,6 +32,17 @@ below were exercised manually but confirm the service and BIRD2 integration work
 
 ---
 
+## Verified on Moscow VPS (fresh install via install.sh, Apr 2026)
+
+- [x] Fresh Ubuntu 24.04 — install.sh runs to completion (after bug fixes above)
+- [x] BGP session established (AS 64998, antifilter.network peer)
+- [x] 24k+ routes received and installed in kernel via `wg-ch`
+- [x] dnsmasq TLD routing enabled (`.ru` → `tld_isp` ipset → `dnsmasq-isp.list`)
+- [x] bird-route-manager reads ipset and writes routes with ISP gateway
+- [x] `dnsmasq_isp` protocol active with preference 150
+
+---
+
 ## Still needs verification
 
 ### install.sh — verified on Kemerovo VPS (re-install path, Apr 2026)
@@ -43,7 +54,11 @@ below were exercised manually but confirm the service and BIRD2 integration work
 - [x] Updated `bird.conf` managed section results in a working BGP session
 - [x] Re-run is idempotent — prompts for each value, only changes what is confirmed
 - [ ] Token change path: re-run → change token → old token rejected, new accepted (not yet tested)
-- [ ] Runs to completion on a truly fresh Ubuntu 22.04/24.04 VPS with no prior config
+- [x] Runs to completion on a fresh Ubuntu 24.04 VPS with no prior config (Moscow VPS, Apr 2026)
+  - Bug found & fixed: Ubuntu's default `bird.conf` has `protocol device` and `protocol kernel` — appending the managed section caused duplicates. Fix: replace entire file instead of appending.
+  - Bug found & fixed: `command -v dnsmasq` returns true when only `dnsmasq-base` is installed (no service). Fix: check via `dpkg -l` instead.
+  - Bug found & fixed: `resolv.conf` was updated to `127.0.0.1` before dnsmasq started, breaking DNS for subsequent `apt` commands. Fix: start dnsmasq first, then update `resolv.conf`.
+  - Bug found & fixed: local AS `64999` conflicted with Kemerovo's BGP session to the same peer. Used `64998` for Moscow.
 
 ### BIRD2 integration
 - [ ] Empty push clears routes from kernel (`ip route show` confirms removal)
@@ -67,6 +82,14 @@ below were exercised manually but confirm the service and BIRD2 integration work
 ### Systemd
 - [ ] Service restarts automatically after a crash (`Restart=on-failure`)
 - [ ] Service starts correctly on boot after a full reboot (after `bird.service` is up)
+
+### dnsmasq ipset layer
+- [x] dnsmasq populates ipset on `.ru` DNS queries (verified on Moscow VPS, Apr 2026)
+- [x] bird-route-manager reads ipset and writes `dnsmasq-isp.list` with ISP gateway
+- [x] `dnsmasq_isp` protocol loads with preference 150
+- [x] ipset entries expire after timeout (6h default)
+- [ ] dnsmasq restart recovery: does `dnsmasq-isp.list` get stale if dnsmasq stops?
+- [ ] Large ipset performance: what happens with 10k+ entries in the route file?
 
 ### Edge cases
 - [ ] RIPE Stat API timeout: ASN entry is skipped gracefully, rest of push succeeds

@@ -39,7 +39,7 @@ HTTP push  ─→  Handler  ─→  Manager.Update()  ─→  resolveEntries()  
 ```
 
 Two injectable interfaces make everything testable without BIRD2 or real networking:
-- `Executor` — `DefaultGW()` and `BirdConfigure()` (faked in tests)
+- `Executor` — `DefaultGW()`, `BirdConfigure()`, and `ReadIPSet()` (faked in tests)
 - `Resolver` — `LookupHost()` and `LookupASN()` (faked in tests)
 
 Tests spin up the full HTTP server with `httptest.NewServer` and make real HTTP requests against it. No mocking framework — just struct fakes in `main_test.go`.
@@ -81,22 +81,34 @@ include "/opt/bird-route-manager/bird-extra.conf";
 
 `bird-extra.conf` (also in WorkDir) contains the two `protocol static user_vpn / user_isp` blocks that include the route list files. On re-runs, `install.sh` replaces just the managed section using a Python one-liner — it never touches anything outside the delimiters.
 
-**Known issue:** If the user has an existing `bird.conf` with no managed section, `install.sh` appends the section. If that existing config already has a `protocol kernel` block, there will be two kernel exporters. BIRD2 allows this but it's redundant. The fix is to merge the filter clauses manually.
+On re-install with an existing `bird.conf` that has no managed section, `install.sh` replaces the entire file (backing up the original). This avoids duplicate protocol definitions from Ubuntu's default `bird.conf`.
+
+---
+
+## dnsmasq ipset layer (optional)
+
+When `DNSMASQ_IPSET` env var is set, the service reads a kernel ipset on every apply/refresh and writes a separate BIRD2 route file (`dnsmasq-isp.list`). This enables TLD-based ISP routing — e.g. all `.ru` domains go via ISP instead of VPN.
+
+**How it works:** dnsmasq is configured with `ipset=/.ru/tld_isp` — every DNS query for a `.ru` domain adds the resolved IPs to the `tld_isp` kernel ipset with a timeout (default 6h). bird-route-manager reads this ipset via `Executor.ReadIPSet()`, writes the IPs as BIRD2 static routes via ISP gateway, and reloads. The `dnsmasq_isp` protocol has preference 150 (beats BGP at 100, loses to user lists at 200). Ipset entries auto-expire, so stale IPs fall back to normal routing.
+
+`install.sh` handles the full setup: dnsmasq + ipset packages, dnsmasq config, ipset boot-persistence systemd unit, BIRD2 `dnsmasq_isp` protocol block, and kernel export filter.
+
+**Config:** `DNSMASQ_IPSET` (ipset name), `DNSMASQ_TLDS` (space-separated TLDs), `DNSMASQ_IPSET_TIMEOUT` (seconds, 0 = no expiry).
 
 ---
 
 ## Testing
 
 ```bash
-go test -race ./...   # all 32 tests, ~1.5s
+go test -race ./...   # all 38 tests, ~0.5s
 go vet ./...
 ```
 
 Tests are in `main_test.go` in the same package (`package main`) so they can access unexported types.
 
-What the tests cover: HMAC auth, entry classification, deduplication, route file format, atomic writes, state persistence across simulated restarts, background refresh, HTTP handler auth/rate-limit/error paths, concurrent pushes, interface nexthop format, server header suppression.
+What the tests cover: HMAC auth, entry classification, deduplication, route file format, atomic writes, state persistence across simulated restarts, background refresh, HTTP handler auth/rate-limit/error paths, concurrent pushes, interface nexthop format, server header suppression, dnsmasq ipset parsing/apply/disable/errors/refresh.
 
-What the tests do NOT cover: actual `birdc` execution, actual kernel routes, actual DNS, actual RIPE API, `install.sh`. See `TODO.md` for the full list and a smoke-test script to run on a real VPS.
+What the tests do NOT cover: actual `birdc` execution, actual kernel routes, actual DNS, actual RIPE API, actual `ipset` commands, `install.sh`. See `TODO.md` for the full list and a smoke-test script to run on a real VPS.
 
 ---
 
