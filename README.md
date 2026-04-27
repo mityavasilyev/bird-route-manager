@@ -15,6 +15,7 @@ You give it a list of IPs, CIDRs, domain names, and AS numbers. It resolves them
 - **Persists** raw entry lists to `state.json` — routes survive service restarts without any external push
 - **Auto-refreshes** every N hours (default: 6) so DNS changes are picked up automatically
 - **Optionally exposes** an HMAC-signed HTTP push API so external tools (cron jobs, scripts) can update lists remotely
+- **Optionally routes entire TLDs via ISP** (e.g. all `.ru` domains) using dnsmasq + kernel ipset integration
 
 All application files live in `/opt/bird-route-manager/`. Nothing else is written outside that directory except one systemd unit and a managed section in `/etc/bird/bird.conf`.
 
@@ -108,6 +109,7 @@ All config is read from `/opt/bird-route-manager/env` (written by `setup.sh`).
 | `LISTEN_ADDR` | `127.0.0.1:8081` | HTTP listen address (nginx proxies this) |
 | `TIMESTAMP_WINDOW` | `300` | Max clock skew for API auth (seconds) |
 | `RATE_LIMIT_MAX` | `5` | Max API requests per 60-second window |
+| `DNSMASQ_IPSET` | _(empty)_ | Kernel ipset name for TLD routing. Empty = disabled. |
 
 ## Push API
 
@@ -149,35 +151,40 @@ When `SYNC_TOKEN` is not set, all requests return `503 api not enabled`.
 
 ## BIRD2 integration
 
-`setup.sh` appends a managed section to `/etc/bird/bird.conf`:
+`install.sh` writes a managed section in `/etc/bird/bird.conf` (replacing any existing default config on first install):
 
 ```bird
 protocol static user_vpn {
-    ipv4;
+    ipv4 { preference 200; };
     include "/opt/bird-route-manager/user-vpn.list";
 }
 
 protocol static user_isp {
-    ipv4;
+    ipv4 { preference 200; };
     include "/opt/bird-route-manager/user-isp.list";
 }
-```
 
-And a kernel protocol that exports these routes:
-
-```bird
-protocol kernel brm_kernel {
-    ipv4 {
-        export filter {
-            if proto = "user_vpn" then accept;
-            if proto = "user_isp" then accept;
-            reject;
-        };
-    };
+# Only when dnsmasq TLD routing is enabled:
+protocol static dnsmasq_isp {
+    ipv4 { preference 150; };
+    include "/opt/bird-route-manager/dnsmasq-isp.list";
 }
 ```
 
-If you already have a `protocol kernel` block, merge the filter clauses into it to avoid having two kernel exporters. The `include` files are in BIRD2 static route format — you can inspect them directly: `cat /opt/bird-route-manager/user-vpn.list`.
+The kernel export filter accepts routes from `bgp_feed`, `user_vpn`, `user_isp`, and `dnsmasq_isp`. The `include` files are in BIRD2 static route format — you can inspect them directly: `cat /opt/bird-route-manager/user-vpn.list`.
+
+## TLD-based ISP routing (optional)
+
+Route all domains under specific TLDs (e.g. `.ru`) via ISP automatically. Enable it during `install.sh` setup.
+
+**How it works:**
+1. dnsmasq resolves DNS queries and adds IPs for matching TLDs to a kernel ipset
+2. bird-route-manager reads the ipset on every apply/refresh cycle
+3. IPs are written to `dnsmasq-isp.list` as BIRD2 static routes via the ISP gateway
+4. The `dnsmasq_isp` protocol has preference 150 — beats BGP (100) but loses to user lists (200)
+5. Ipset entries auto-expire (default 6h), so stale IPs fall back to normal routing
+
+`install.sh` handles everything: dnsmasq + ipset packages, config files, systemd units, and BIRD2 protocol setup. To disable later, re-run `install.sh` and answer no, or set `DNSMASQ_IPSET=` in the env file.
 
 ## Uninstall
 
