@@ -860,6 +860,56 @@ else
     note "Check: journalctl -u bird-route-manager --no-pager -n 20"
 fi
 
+# nginx reverse proxy for the push API
+if command -v nginx &>/dev/null && systemctl is-active --quiet nginx; then
+    NGINX_DEFAULT="/etc/nginx/sites-available/default"
+    if [[ -f "$NGINX_DEFAULT" ]]; then
+        if grep -q "proxy_pass.*8081" "$NGINX_DEFAULT" 2>/dev/null; then
+            ok "nginx already proxies to bird-route-manager API"
+        else
+            echo ""
+            note "nginx is running but has no proxy rule for the bird-route-manager API."
+            note "Without it, the push API is only reachable on localhost:8081."
+            if ask_yn "Add /api/v1/routes proxy to nginx?" y; then
+                # Insert location block before the catch-all location /
+                python3 - <<'PYEOF'
+import re, sys
+
+path = "/etc/nginx/sites-available/default"
+with open(path) as f:
+    content = f.read()
+
+block = """
+    # bird-route-manager API
+    location = /api/v1/routes {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_read_timeout 180s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+"""
+
+# Insert before the first 'location' directive
+new_content = re.sub(r'(\s+location\s)', block + r'\1', content, count=1)
+if new_content == content:
+    print("    WARNING: could not find insertion point — add the location block manually")
+    sys.exit(0)
+
+with open(path, "w") as f:
+    f.write(new_content)
+print("    nginx config updated")
+PYEOF
+                if nginx -t 2>/dev/null; then
+                    systemctl reload nginx
+                    ok "nginx reloaded with API proxy"
+                else
+                    warn "nginx config test failed — check /etc/nginx/sites-available/default manually"
+                fi
+            fi
+        fi
+    fi
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
