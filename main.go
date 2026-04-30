@@ -716,75 +716,66 @@ func errResp(w http.ResponseWriter, code int, msg string) {
 	jsonResp(w, code, map[string]string{"error": msg})
 }
 
-// NewHandler returns an http.Handler for the push API.
-func NewHandler(cfg Config, mgr *Manager) http.Handler {
+// readAllLimited reads up to max bytes from r.Body.
+func readAllLimited(r io.Reader, max int64) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r, max))
+}
+
+// NewHandler returns an http.Handler for all API endpoints.
+// If fvpnMgr is nil, the fullvpn endpoints are disabled.
+func NewHandler(cfg Config, mgr *Manager, fvpnMgr *FullVPNManager) http.Handler {
 	rl := newRateLimiter(cfg.RateLimitMax)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != apiPath || r.Method != http.MethodPost {
+		switch r.URL.Path {
+		case apiPath:
+			// Routes endpoint
+			body := verifyAndReadBody(cfg, rl, w, r)
+			if body == nil {
+				return
+			}
+
+			var p pushPayload
+			if err := json.Unmarshal(body, &p); err != nil {
+				errResp(w, http.StatusBadRequest, "bad request")
+				return
+			}
+			vpn := cleanEntries(p.VPN)
+			isp := cleanEntries(p.ISP)
+
+			vpnN, ispN, err := mgr.Update(vpn, isp)
+			if err != nil {
+				log.Printf("update error: %v", err)
+				errResp(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			jsonResp(w, http.StatusOK, pushResponse{OK: true, VPNRoutes: vpnN, ISPRoutes: ispN})
+
+		case fullvpnPath:
+			if fvpnMgr == nil {
+				errResp(w, http.StatusNotFound, "not found")
+				return
+			}
+			body := verifyAndReadBody(cfg, rl, w, r)
+			if body == nil {
+				return
+			}
+			fvpnMgr.HandleFullVPN(cfg, w, r, body)
+
+		case peersPath:
+			if fvpnMgr == nil {
+				errResp(w, http.StatusNotFound, "not found")
+				return
+			}
+			body := verifyAndReadBody(cfg, rl, w, r)
+			if body == nil {
+				return
+			}
+			fvpnMgr.HandlePeers(cfg, w, r, body)
+
+		default:
 			errResp(w, http.StatusNotFound, "not found")
-			return
 		}
-
-		// API disabled
-		if cfg.Token == "" {
-			errResp(w, http.StatusServiceUnavailable, "api not enabled")
-			return
-		}
-
-		if !rl.Allow() {
-			errResp(w, http.StatusTooManyRequests, "too many requests")
-			return
-		}
-
-		body, err := io.ReadAll(io.LimitReader(r.Body, cfg.MaxBodyBytes+1))
-		if err != nil {
-			errResp(w, http.StatusBadRequest, "bad request")
-			return
-		}
-		if int64(len(body)) > cfg.MaxBodyBytes {
-			errResp(w, http.StatusRequestEntityTooLarge, "payload too large")
-			return
-		}
-
-		if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
-			errResp(w, http.StatusUnsupportedMediaType, "unsupported media type")
-			return
-		}
-
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			errResp(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		bearer := strings.TrimPrefix(auth, "Bearer ")
-		tsStr := r.Header.Get("X-Timestamp")
-
-		if !tsInWindow(tsStr, cfg.TimestampWindow) {
-			errResp(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		if !verifyHMAC(cfg.Token, bearer, tsStr, body) {
-			errResp(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-
-		var p pushPayload
-		if err := json.Unmarshal(body, &p); err != nil {
-			errResp(w, http.StatusBadRequest, "bad request")
-			return
-		}
-		vpn := cleanEntries(p.VPN)
-		isp := cleanEntries(p.ISP)
-
-		vpnN, ispN, err := mgr.Update(vpn, isp)
-		if err != nil {
-			log.Printf("update error: %v", err)
-			errResp(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-
-		jsonResp(w, http.StatusOK, pushResponse{OK: true, VPNRoutes: vpnN, ISPRoutes: ispN})
 	})
 }
 
@@ -800,9 +791,9 @@ func main() {
 		log.Fatalf("create work dir: %v", err)
 	}
 
-	exec := systemExecutor{}
+	sysExec := systemExecutor{}
 	res := newNetResolver()
-	mgr := NewManager(cfg, exec, res)
+	mgr := NewManager(cfg, sysExec, res)
 
 	if err := mgr.EnsureFiles(); err != nil {
 		log.Fatalf("ensure files: %v", err)
@@ -814,9 +805,24 @@ func main() {
 
 	mgr.StartRefresher(ctx)
 
+	// Full-VPN per-peer override (optional)
+	var fvpnMgr *FullVPNManager
+	fvpnCfg := fullvpnConfigFromEnv(cfg.WorkDir, cfg.VPNInterface)
+	if fvpnCfg.Enabled {
+		fvpnMgr = NewFullVPNManager(fvpnCfg, systemFullVPNExecutor{})
+		fvpnMgr.LoadPeers()
+		if err := fvpnMgr.Setup(); err != nil {
+			log.Printf("fullvpn: route setup warning: %v", err)
+		}
+		fvpnMgr.LoadState()
+		fvpnMgr.StartCleanupTicker(ctx)
+		log.Printf("fullvpn: enabled (container=%s, duration=%v, cleanup=%v)",
+			fvpnCfg.ContainerName, fvpnCfg.OverrideDuration, fvpnCfg.CleanupInterval)
+	}
+
 	srv := &http.Server{
 		Addr:         cfg.ListenAddr,
-		Handler:      NewHandler(cfg, mgr),
+		Handler:      NewHandler(cfg, mgr, fvpnMgr),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 180 * time.Second, // long: resolution can take time
 		IdleTimeout:  60 * time.Second,

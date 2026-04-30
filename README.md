@@ -145,6 +145,8 @@ Requests with a timestamp outside ±5 minutes are rejected (replay protection). 
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/routes` | Push new entry lists |
+| `POST` | `/api/v1/fullvpn` | Enable/disable/list full-VPN overrides (requires `FULLVPN_ENABLED=true`) |
+| `POST` | `/api/v1/peers` | Set/list peer name→pubkey mappings (requires `FULLVPN_ENABLED=true`) |
 | any other | any | `404 not found` |
 
 When `SYNC_TOKEN` is not set, all requests return `503 api not enabled`.
@@ -185,6 +187,51 @@ Route all domains under specific TLDs (e.g. `.ru`) via ISP automatically. Enable
 5. Ipset entries auto-expire (default 6h), so stale IPs fall back to normal routing
 
 `install.sh` handles everything: dnsmasq + ipset packages, config files, systemd units, and BIRD2 protocol setup. To disable later, re-run `install.sh` and answer no, or set `DNSMASQ_IPSET=` in the env file.
+
+## Full-VPN per-peer override (optional)
+
+Temporarily route individual VPN peers through the VPN tunnel for **all** traffic, bypassing split routing. Overrides auto-expire (default 15 minutes). Enable it during `install.sh` setup.
+
+Designed for setups where VPN peers connect through an AmneziaWG Docker container. The service reads peer info from the container (via `docker exec`), then uses `nsenter` + `ip rule` to selectively route specific peers through the VPN tunnel.
+
+### Managing peers
+
+Register your VPN peers (name → WireGuard public key):
+
+```bash
+BODY='{"peers":{"alice":"NV5DpuFVhRgY/xQTxE0Ctcd9pGa2ONuLRcFPusFpqSI=","bob":"5bziAfQQu3/rvQs428oWwGMjV3v8WsWIetTxFI6Qt2U="}}'
+# sign and POST to /api/v1/peers (same auth as /api/v1/routes)
+```
+
+### Toggling full VPN
+
+```bash
+# Enable (routes all traffic through VPN for 15 minutes)
+BODY='{"peer":"alice"}'
+# sign and POST to /api/v1/fullvpn
+
+# Disable early
+BODY='{"peer":"alice","enable":false}'
+# sign and POST to /api/v1/fullvpn
+
+# List active overrides
+BODY='{}'
+# sign and POST to /api/v1/fullvpn
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `FULLVPN_ENABLED` | _(empty)_ | Set to `true` to enable |
+| `AWG_CONTAINER` | `amnezia-awg` | Docker container name |
+| `AWG_WG_INTERFACE` | `wg0` | WireGuard interface inside container |
+| `AWG_CONTAINER_IFACE` | `eth1` | Container's outgoing network interface |
+| `FULLVPN_DURATION` | `900` | Override duration in seconds |
+| `FULLVPN_CLEANUP` | `180` | Cleanup/re-apply interval in seconds |
+| `FULLVPN_SUBNET` | `10.8.3.0/24` | VPN client subnet |
+| `FULLVPN_BRIDGE` | `amn0` | Docker bridge interface |
+| `FULLVPN_BRIDGE_IP` | `172.29.172.2` | Container's bridge IP |
 
 ## Uninstall
 

@@ -518,7 +518,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Manager, *fakeExecutor) {
 	if err := mgr.EnsureFiles(); err != nil {
 		t.Fatalf("EnsureFiles: %v", err)
 	}
-	srv := httptest.NewServer(NewHandler(cfg, mgr))
+	srv := httptest.NewServer(NewHandler(cfg, mgr, nil))
 	t.Cleanup(srv.Close)
 	return srv, mgr, exec
 }
@@ -681,7 +681,7 @@ func TestHandlerAPIDisabled(t *testing.T) {
 	res := newFakeResolver()
 	mgr := NewManager(cfg, exec, res)
 	_ = mgr.EnsureFiles()
-	srv := httptest.NewServer(NewHandler(cfg, mgr))
+	srv := httptest.NewServer(NewHandler(cfg, mgr, nil))
 	defer srv.Close()
 
 	body, _ := json.Marshal(pushPayload{VPN: []string{"1.2.3.4"}, ISP: nil})
@@ -707,7 +707,7 @@ func TestHandlerRateLimit(t *testing.T) {
 	res := newFakeResolver()
 	mgr := NewManager(cfg, exec, res)
 	_ = mgr.EnsureFiles()
-	srv := httptest.NewServer(NewHandler(cfg, mgr))
+	srv := httptest.NewServer(NewHandler(cfg, mgr, nil))
 	defer srv.Close()
 
 	payload := pushPayload{VPN: []string{}, ISP: []string{}}
@@ -759,7 +759,7 @@ func TestE2ELifecycle(t *testing.T) {
 	}
 
 	// Step 2: Push routes via HTTP
-	srv := httptest.NewServer(NewHandler(cfg, mgr1))
+	srv := httptest.NewServer(NewHandler(cfg, mgr1, nil))
 	defer srv.Close()
 
 	resp := doPost(t, srv, cfg.Token, pushPayload{

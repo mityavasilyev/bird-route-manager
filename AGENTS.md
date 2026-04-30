@@ -16,8 +16,10 @@ The intended use case: a Russian VPS running AmneziaWG/WireGuard as a VPN exit. 
 
 | File | Purpose |
 |---|---|
-| `main.go` | Entire service — single file, stdlib only |
-| `main_test.go` | Unit + e2e tests — all system calls faked |
+| `main.go` | Core service — route management, HTTP dispatch, entry point |
+| `fullvpn.go` | Full-VPN per-peer override module — separate executor, state, handlers |
+| `main_test.go` | Unit + e2e tests for core features — all system calls faked |
+| `fullvpn_test.go` | Tests for fullvpn module — fakeFullVPNExecutor |
 | `go.mod` | `go 1.25`, module `github.com/mityavasilyev/bird-route-manager` |
 | `install.sh` | Interactive idempotent installer — the user-facing entry point |
 | `TODO.md` | What has NOT been tested on real hardware — read before shipping |
@@ -29,18 +31,26 @@ The intended use case: a Russian VPS running AmneziaWG/WireGuard as a VPN exit. 
 
 ```
 HTTP push  ─→  Handler  ─→  Manager.Update()  ─→  resolveEntries()  ─→  atomicWrite()  ─→  BirdConfigure()
-                                │                                                               │
-                           saveState()                                                    Executor interface
-                                │                                                        (real: exec birdc)
-                          state.json                                                     (test: fakeExecutor)
-                                │
-                    (on startup) LoadState()
-                    (on ticker)  Refresh()  ─→  same resolve → write → reload path
+                  │              │                                                               │
+                  │         saveState()                                                    Executor interface
+                  │              │                                                        (real: exec birdc)
+                  │        state.json                                                     (test: fakeExecutor)
+                  │              │
+                  │  (on startup) LoadState()
+                  │  (on ticker)  Refresh()  ─→  same resolve → write → reload path
+                  │
+                  ├─→  FullVPNManager.HandleFullVPN()  ─→  Enable/Disable  ─→  FullVPNExecutor
+                  │         │                                                   (nsenter, ip rule,
+                  │    fullvpn-state.json                                        docker exec)
+                  │    peers.json
+                  │
+                  └─→  FullVPNManager.HandlePeers()
 ```
 
-Two injectable interfaces make everything testable without BIRD2 or real networking:
+Three injectable interfaces make everything testable without BIRD2 or real networking:
 - `Executor` — `DefaultGW()`, `BirdConfigure()`, and `ReadIPSet()` (faked in tests)
 - `Resolver` — `LookupHost()` and `LookupASN()` (faked in tests)
+- `FullVPNExecutor` — `WgPeers()`, `ContainerPID()`, `NATBypass()`, `PolicyRule()`, `EnsureRouteSetup()` (faked in tests)
 
 Tests spin up the full HTTP server with `httptest.NewServer` and make real HTTP requests against it. No mocking framework — just struct fakes in `main_test.go`.
 
@@ -97,18 +107,44 @@ When `DNSMASQ_IPSET` env var is set, the service reads a kernel ipset on every a
 
 ---
 
+## Full-VPN per-peer override (optional)
+
+When `FULLVPN_ENABLED=true`, the service can temporarily route individual VPN peers through the VPN tunnel for ALL traffic (bypassing split routing). Designed for AmneziaWG running in Docker.
+
+**The problem:** The AmneziaWG container masquerades all peer traffic (`10.8.3.0/24 → 172.29.172.2`) before it reaches the host, so the host can't distinguish peers for routing.
+
+**The solution:** For override-active peers, `nsenter` adds a transient NAT bypass rule in the container's network namespace (`iptables -t nat -I POSTROUTING -s <peer_ip> -o eth1 -j RETURN`), then a host `ip rule from <peer_ip> table fulltunnel` routes that peer via the VPN tunnel. These rules are ephemeral — lost on container restart — and the cleanup ticker re-applies them every 3 minutes.
+
+**Module structure:** `fullvpn.go` is a self-contained module with its own `FullVPNExecutor` interface (separate from the main `Executor`), state management, and HTTP handlers. All container interaction is isolated in the executor, so if the container setup changes, only the executor implementation needs updating.
+
+**State files:**
+- `peers.json` — name→pubkey mapping, managed via `POST /api/v1/peers`
+- `fullvpn-state.json` — active overrides with expiry times
+
+**API endpoints** (same HMAC auth as `/api/v1/routes`):
+- `POST /api/v1/fullvpn` — enable/disable/list overrides
+- `POST /api/v1/peers` — set/list peer name→pubkey mappings
+
+**Config:** `FULLVPN_ENABLED`, `AWG_CONTAINER`, `AWG_WG_INTERFACE`, `AWG_CONTAINER_IFACE`, `FULLVPN_TABLE`, `FULLVPN_DURATION` (seconds), `FULLVPN_CLEANUP` (seconds), `FULLVPN_SUBNET`, `FULLVPN_BRIDGE`, `FULLVPN_BRIDGE_IP`.
+
+**One-time host setup** (handled by `install.sh` + service startup):
+- `/etc/iproute2/rt_tables` gets `100 fulltunnel` entry (install.sh, persistent)
+- Service calls `EnsureRouteSetup()` on startup to set runtime routes + MASQUERADE (idempotent)
+
+---
+
 ## Testing
 
 ```bash
-go test -race ./...   # all 38 tests, ~0.5s
+go test -race ./...   # all 65 tests, ~1.5s
 go vet ./...
 ```
 
-Tests are in `main_test.go` in the same package (`package main`) so they can access unexported types.
+Tests are in `main_test.go` and `fullvpn_test.go` in the same package (`package main`) so they can access unexported types.
 
-What the tests cover: HMAC auth, entry classification, deduplication, route file format, atomic writes, state persistence across simulated restarts, background refresh, HTTP handler auth/rate-limit/error paths, concurrent pushes, interface nexthop format, server header suppression, dnsmasq ipset parsing/apply/disable/errors/refresh.
+What the tests cover: HMAC auth, entry classification, deduplication, route file format, atomic writes, state persistence across simulated restarts, background refresh, HTTP handler auth/rate-limit/error paths, concurrent pushes, interface nexthop format, server header suppression, dnsmasq ipset parsing/apply/disable/errors/refresh, fullvpn peer lookup (by name/pubkey), fullvpn enable/disable/expiry/cleanup, fullvpn state persistence, fullvpn HTTP handlers (enable/disable/list/peers/auth), rollback on partial failure.
 
-What the tests do NOT cover: actual `birdc` execution, actual kernel routes, actual DNS, actual RIPE API, actual `ipset` commands, `install.sh`. See `TODO.md` for the full list and a smoke-test script to run on a real VPS.
+What the tests do NOT cover: actual `birdc` execution, actual kernel routes, actual DNS, actual RIPE API, actual `ipset` commands, actual `docker exec`/`nsenter`, `install.sh`. See `TODO.md` for the full list and a smoke-test script to run on a real VPS.
 
 ---
 
@@ -130,6 +166,6 @@ What the tests do NOT cover: actual `birdc` execution, actual kernel routes, act
 
 **New entry type** (e.g. IPv6): add a case to `classify()`, handle it in `resolveEntries()`, update `cleanEntries()` validation, add tests. The route file writer and state persistence need no changes.
 
-**New API endpoint**: add a path check in `NewHandler`. Keep the pattern: unknown path → 404 (don't reveal path existence).
+**New API endpoint**: add a `case` to the `switch r.URL.Path` in `NewHandler`. Keep the pattern: unknown path → 404 (don't reveal path existence). Use `verifyAndReadBody()` for auth.
 
 **Web UI**: out of scope for this tool. The service is designed to be driven by external automation (cron jobs, scripts). A UI belongs in a separate companion tool.

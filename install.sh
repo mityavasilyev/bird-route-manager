@@ -421,6 +421,86 @@ else
     DNSMASQ_TIMEOUT="$CURRENT_DNSMASQ_TIMEOUT"
 fi
 
+# ── Full-VPN per-peer override (optional) ──
+
+note "Temporarily route individual VPN peers through the VPN tunnel for all"
+note "traffic (bypassing split routing). Requires an AmneziaWG Docker container."
+echo ""
+
+CURRENT_FULLVPN=$(env_get "FULLVPN_ENABLED" "")
+CURRENT_AWG_CONTAINER=$(env_get "AWG_CONTAINER" "amnezia-awg")
+CURRENT_AWG_WG_IFACE=$(env_get "AWG_WG_INTERFACE" "wg0")
+CURRENT_AWG_CONT_IFACE=$(env_get "AWG_CONTAINER_IFACE" "eth1")
+CURRENT_FULLVPN_SUBNET=$(env_get "FULLVPN_SUBNET" "10.8.3.0/24")
+CURRENT_FULLVPN_BRIDGE=$(env_get "FULLVPN_BRIDGE" "amn0")
+CURRENT_FULLVPN_BRIDGE_IP=$(env_get "FULLVPN_BRIDGE_IP" "172.29.172.2")
+CURRENT_FULLVPN_DURATION=$(env_get "FULLVPN_DURATION" "900")
+CURRENT_FULLVPN_CLEANUP=$(env_get "FULLVPN_CLEANUP" "180")
+ENABLE_FULLVPN=false
+CHANGE_FULLVPN=true
+
+if [[ "$CURRENT_FULLVPN" == "true" ]]; then
+    echo -e "  Full-VPN override: ${CYAN}enabled${RESET} (container: ${CURRENT_AWG_CONTAINER})"
+    ask_yn "Change settings?" n && CHANGE_FULLVPN=true || CHANGE_FULLVPN=false
+    ENABLE_FULLVPN=true
+else
+    echo -e "  Full-VPN override: ${DIM}disabled${RESET}"
+fi
+
+if $CHANGE_FULLVPN; then
+    if [[ "$CURRENT_FULLVPN" == "true" ]]; then
+        _fvpn_default="y"
+    else
+        _fvpn_default="n"
+    fi
+    if ask_yn "Enable full-VPN per-peer override?" "$_fvpn_default"; then
+        ENABLE_FULLVPN=true
+        echo ""
+
+        # Try to auto-detect container settings
+        _detected_container=""
+        _detected_bridge=""
+        _detected_bridge_ip=""
+        if command -v docker &>/dev/null; then
+            _detected_container=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -i amnezia | head -1)
+            if [[ -n "$_detected_container" ]]; then
+                # Auto-detect bridge and IP from Docker network
+                _net_id=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.NetworkID}}{{end}}' 2>/dev/null | head -c 12)
+                if [[ -n "$_net_id" ]]; then
+                    _detected_bridge=$(ip link show 2>/dev/null | grep -oP "br-${_net_id}\S*" | head -1)
+                    [[ -z "$_detected_bridge" ]] && _detected_bridge=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.Bridge}}{{end}}' 2>/dev/null)
+                fi
+                _detected_bridge_ip=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+            fi
+        fi
+
+        AWG_CONTAINER=$(ask "Docker container name" "${_detected_container:-$CURRENT_AWG_CONTAINER}")
+        AWG_WG_IFACE=$(ask "WireGuard interface inside container" "$CURRENT_AWG_WG_IFACE")
+        AWG_CONT_IFACE=$(ask "Container outgoing interface" "$CURRENT_AWG_CONT_IFACE")
+        FULLVPN_SUBNET=$(ask "VPN client subnet" "$CURRENT_FULLVPN_SUBNET")
+        FULLVPN_BRIDGE=$(ask "Docker bridge interface" "${_detected_bridge:-$CURRENT_FULLVPN_BRIDGE}")
+        FULLVPN_BRIDGE_IP=$(ask "Container bridge IP" "${_detected_bridge_ip:-$CURRENT_FULLVPN_BRIDGE_IP}")
+        FULLVPN_DURATION=$(ask "Override duration (seconds)" "$CURRENT_FULLVPN_DURATION")
+        FULLVPN_CLEANUP=$(ask "Cleanup interval (seconds)" "$CURRENT_FULLVPN_CLEANUP")
+
+        ok "Full-VPN: ${AWG_CONTAINER}, subnet ${FULLVPN_SUBNET}, duration ${FULLVPN_DURATION}s"
+    else
+        ENABLE_FULLVPN=false
+        ok "Full-VPN override: disabled"
+    fi
+else
+    AWG_CONTAINER="$CURRENT_AWG_CONTAINER"
+    AWG_WG_IFACE="$CURRENT_AWG_WG_IFACE"
+    AWG_CONT_IFACE="$CURRENT_AWG_CONT_IFACE"
+    FULLVPN_SUBNET="$CURRENT_FULLVPN_SUBNET"
+    FULLVPN_BRIDGE="$CURRENT_FULLVPN_BRIDGE"
+    FULLVPN_BRIDGE_IP="$CURRENT_FULLVPN_BRIDGE_IP"
+    FULLVPN_DURATION="$CURRENT_FULLVPN_DURATION"
+    FULLVPN_CLEANUP="$CURRENT_FULLVPN_CLEANUP"
+fi
+
+echo ""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # [5/6] Applying
 # ─────────────────────────────────────────────────────────────────────────────
@@ -626,7 +706,31 @@ elif [[ -z "$CURRENT_TOKEN" ]]; then
     env_set "SYNC_TOKEN" ""
 fi
 
+if $ENABLE_FULLVPN; then
+    env_set "FULLVPN_ENABLED"      "true"
+    env_set "AWG_CONTAINER"        "$AWG_CONTAINER"
+    env_set "AWG_WG_INTERFACE"     "$AWG_WG_IFACE"
+    env_set "AWG_CONTAINER_IFACE"  "$AWG_CONT_IFACE"
+    env_set "FULLVPN_SUBNET"       "$FULLVPN_SUBNET"
+    env_set "FULLVPN_BRIDGE"       "$FULLVPN_BRIDGE"
+    env_set "FULLVPN_BRIDGE_IP"    "$FULLVPN_BRIDGE_IP"
+    env_set "FULLVPN_DURATION"     "$FULLVPN_DURATION"
+    env_set "FULLVPN_CLEANUP"      "$FULLVPN_CLEANUP"
+else
+    env_set "FULLVPN_ENABLED" ""
+fi
+
 ok "Config written: $ENV_FILE"
+
+# 5d2 — Full-VPN routing table (persistent across reboots)
+if $ENABLE_FULLVPN; then
+    if ! grep -q "^100[[:space:]]" /etc/iproute2/rt_tables; then
+        echo "100 fulltunnel" >> /etc/iproute2/rt_tables
+        ok "Added fulltunnel routing table to /etc/iproute2/rt_tables"
+    else
+        ok "fulltunnel routing table already configured"
+    fi
+fi
 
 # 5e — BIRD2 extra config (static protocol blocks included by bird.conf)
 {
@@ -743,6 +847,32 @@ fi
 bird -p 2>/dev/null && ok "BIRD2 config syntax OK" || warn "bird -p returned non-zero — check manually"
 
 # 5g — Systemd unit
+#
+# When full-VPN is enabled, the service needs:
+#   - Access to Docker socket (docker exec/inspect)
+#   - nsenter into container network namespace
+#   - ip rule / iptables on the host
+# These require relaxing ProtectSystem and NoNewPrivileges.
+if $ENABLE_FULLVPN; then
+cat > "$SYSTEMD_UNIT" << EOF
+[Unit]
+Description=bird-route-manager — self-managing BIRD2 split-routing
+Documentation=https://github.com/mityavasilyev/bird-route-manager
+After=network-online.target bird.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$BINARY
+EnvironmentFile=$ENV_FILE
+Restart=on-failure
+RestartSec=10
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+else
 cat > "$SYSTEMD_UNIT" << EOF
 [Unit]
 Description=bird-route-manager — self-managing BIRD2 split-routing
@@ -764,6 +894,7 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 systemctl daemon-reload
 ok "Systemd unit installed"
@@ -881,7 +1012,7 @@ with open(path) as f:
 
 block = """
     # bird-route-manager API
-    location = /api/v1/routes {
+    location /api/v1/ {
         proxy_pass http://127.0.0.1:8081;
         proxy_read_timeout 180s;
         proxy_set_header Host $host;
@@ -925,6 +1056,11 @@ if $ENABLE_DNSMASQ; then
     echo -e "  TLD routing:    ${CYAN}${DNSMASQ_TLDS} → ipset ${DNSMASQ_IPSET_NAME}${RESET} (pref 150, timeout ${DNSMASQ_TIMEOUT}s)"
 else
     echo -e "  TLD routing:    ${DIM}disabled${RESET}"
+fi
+if $ENABLE_FULLVPN; then
+    echo -e "  Full-VPN:       ${CYAN}enabled${RESET} (container: ${AWG_CONTAINER}, duration: ${FULLVPN_DURATION}s)"
+else
+    echo -e "  Full-VPN:       ${DIM}disabled${RESET}"
 fi
 echo -e "  Config:         ${CYAN}$ENV_FILE${RESET}"
 
