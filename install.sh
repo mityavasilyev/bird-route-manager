@@ -1010,7 +1010,16 @@ fi
 if command -v nginx &>/dev/null && systemctl is-active --quiet nginx; then
     NGINX_DEFAULT="/etc/nginx/sites-available/default"
     if [[ -f "$NGINX_DEFAULT" ]]; then
-        if grep -q "proxy_pass.*8081" "$NGINX_DEFAULT" 2>/dev/null; then
+        if grep -q "location = /api/v1/routes" "$NGINX_DEFAULT" 2>/dev/null; then
+            # Upgrade exact-match location to prefix match (covers fullvpn + peers endpoints)
+            sed -i 's|location = /api/v1/routes {|location /api/v1/ {|' "$NGINX_DEFAULT"
+            if nginx -t 2>/dev/null; then
+                systemctl reload nginx
+                ok "nginx location upgraded to /api/v1/ (prefix match)"
+            else
+                warn "nginx config test failed after upgrade — check manually"
+            fi
+        elif grep -q "location /api/v1/" "$NGINX_DEFAULT" 2>/dev/null; then
             ok "nginx already proxies to bird-route-manager API"
         else
             echo ""
