@@ -462,15 +462,30 @@ if $CHANGE_FULLVPN; then
         _detected_bridge=""
         _detected_bridge_ip=""
         if command -v docker &>/dev/null; then
-            _detected_container=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -i amnezia | head -1)
+            _detected_container=$(docker ps --format '{{.Names}}' 2>/dev/null | { grep -i amnezia || true; } | head -1)
             if [[ -n "$_detected_container" ]]; then
                 # Auto-detect bridge and IP from Docker network
-                _net_id=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.NetworkID}}{{end}}' 2>/dev/null | head -c 12)
-                if [[ -n "$_net_id" ]]; then
-                    _detected_bridge=$(ip link show 2>/dev/null | grep -oP "br-${_net_id}\S*" | head -1)
-                    [[ -z "$_detected_bridge" ]] && _detected_bridge=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.Bridge}}{{end}}' 2>/dev/null)
+                _detected_bridge_ip=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || true)
+                # Find the bridge interface — could be br-<id> or a custom name like amn0
+                _net_name=$(docker inspect "$_detected_container" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || true)
+                _net_name=$(echo "$_net_name" | awk '{print $1}')
+                if [[ -n "$_net_name" ]]; then
+                    _detected_bridge=$(docker network inspect "$_net_name" --format '{{range .Options}}{{.}}{{end}}' 2>/dev/null | { grep -oP 'com\.docker\.network\.bridge\.name=\K\S+' || true; })
+                    if [[ -z "$_detected_bridge" ]]; then
+                        # Fallback: find bridge by network ID prefix
+                        _net_id=$(docker network inspect "$_net_name" --format '{{.Id}}' 2>/dev/null | head -c 12 || true)
+                        if [[ -n "$_net_id" ]]; then
+                            _detected_bridge=$(ip link show 2>/dev/null | { grep -oP "br-${_net_id}\S*" || true; } | head -1)
+                        fi
+                    fi
+                    # Last resort: look for the bridge interface that has the container IP's subnet
+                    if [[ -z "$_detected_bridge" && -n "$_detected_bridge_ip" ]]; then
+                        _gw=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+                        if [[ -n "$_gw" ]]; then
+                            _detected_bridge=$(ip -o addr show 2>/dev/null | { grep "$_gw" || true; } | awk '{print $2}' | head -1)
+                        fi
+                    fi
                 fi
-                _detected_bridge_ip=$(docker inspect "$_detected_container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
             fi
         fi
 
