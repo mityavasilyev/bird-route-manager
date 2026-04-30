@@ -109,9 +109,22 @@ func (systemFullVPNExecutor) ContainerPID(container string) (int, error) {
 	return pid, nil
 }
 
-func (systemFullVPNExecutor) NATBypass(pid int, peerIP, containerIface string, add bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// detectIptables determines whether the container uses iptables-legacy or iptables.
+// Many Docker containers (including AmneziaWG) use iptables-legacy for NAT rules.
+func detectIptables(pid int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// Check if iptables-legacy exists and has NAT rules in the container's namespace
+	out, err := exec.CommandContext(ctx, "nsenter", "-t", strconv.Itoa(pid), "-n",
+		"iptables-legacy", "-t", "nat", "-L", "POSTROUTING", "-n").CombinedOutput()
+	if err == nil && strings.Contains(string(out), "MASQUERADE") {
+		return "iptables-legacy"
+	}
+	return "iptables"
+}
+
+func (systemFullVPNExecutor) NATBypass(pid int, peerIP, containerIface string, add bool) error {
+	iptCmd := detectIptables(pid)
 
 	action := "-I"
 	if !add {
@@ -122,7 +135,7 @@ func (systemFullVPNExecutor) NATBypass(pid int, peerIP, containerIface string, a
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer checkCancel()
 	checkErr := exec.CommandContext(checkCtx, "nsenter", "-t", strconv.Itoa(pid), "-n",
-		"iptables", "-t", "nat", "-C", "POSTROUTING",
+		iptCmd, "-t", "nat", "-C", "POSTROUTING",
 		"-s", peerIP, "-o", containerIface, "-j", "RETURN").Run()
 	ruleExists := checkErr == nil
 
@@ -133,11 +146,13 @@ func (systemFullVPNExecutor) NATBypass(pid int, peerIP, containerIface string, a
 		return nil // already gone
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	out, err := exec.CommandContext(ctx, "nsenter", "-t", strconv.Itoa(pid), "-n",
-		"iptables", "-t", "nat", action, "POSTROUTING",
+		iptCmd, "-t", "nat", action, "POSTROUTING",
 		"-s", peerIP, "-o", containerIface, "-j", "RETURN").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("nsenter iptables %s: %w — %s", action, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("nsenter %s %s: %w — %s", iptCmd, action, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -177,31 +192,35 @@ func (systemFullVPNExecutor) PolicyRule(peerIP, table string, add bool) error {
 }
 
 func (systemFullVPNExecutor) EnsureRouteSetup(table, vpnIface, subnet, bridgeName, bridgeIP string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
 	// 1. Default route in the fullvpn table via the VPN interface
-	_ = exec.CommandContext(ctx, "ip", "route", "replace", "default", "dev", vpnIface, "table", table).Run()
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel1()
+	if out, err := exec.CommandContext(ctx1, "ip", "route", "replace", "default", "dev", vpnIface, "table", table).CombinedOutput(); err != nil {
+		log.Printf("fullvpn: warn: default route in table %s: %v — %s", table, err, strings.TrimSpace(string(out)))
+	}
 
 	// 2. Host route for VPN subnet via container bridge IP
-	_ = exec.CommandContext(ctx, "ip", "route", "replace", subnet, "via", bridgeIP, "dev", bridgeName).Run()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if out, err := exec.CommandContext(ctx2, "ip", "route", "replace", subnet, "via", bridgeIP, "dev", bridgeName).CombinedOutput(); err != nil {
+		return fmt.Errorf("host route for %s via %s dev %s: %w — %s", subnet, bridgeIP, bridgeName, err, strings.TrimSpace(string(out)))
+	}
 
 	// 3. MASQUERADE for VPN subnet traffic (idempotent: check first)
-	checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer checkCancel()
-	checkErr := exec.CommandContext(checkCtx, "iptables", "-t", "nat", "-C", "POSTROUTING",
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel3()
+	checkErr := exec.CommandContext(ctx3, "iptables", "-t", "nat", "-C", "POSTROUTING",
 		"-s", subnet, "!", "-o", bridgeName, "-j", "MASQUERADE").Run()
 	if checkErr != nil {
-		// Rule doesn't exist, add it
-		addCtx, addCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer addCancel()
-		if out, err := exec.CommandContext(addCtx, "iptables", "-t", "nat", "-I", "POSTROUTING",
+		ctx4, cancel4 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel4()
+		if out, err := exec.CommandContext(ctx4, "iptables", "-t", "nat", "-I", "POSTROUTING",
 			"-s", subnet, "!", "-o", bridgeName, "-j", "MASQUERADE").CombinedOutput(); err != nil {
 			return fmt.Errorf("iptables MASQUERADE: %w — %s", err, strings.TrimSpace(string(out)))
 		}
 	}
 
-	log.Printf("fullvpn: route setup verified (table=%s, iface=%s, subnet=%s)", table, vpnIface, subnet)
+	log.Printf("fullvpn: route setup OK (table=%s, iface=%s, subnet=%s, bridge=%s via %s)", table, vpnIface, subnet, bridgeName, bridgeIP)
 	return nil
 }
 
