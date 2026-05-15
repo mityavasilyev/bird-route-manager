@@ -677,8 +677,15 @@ DNSEOF
     ok "dnsmasq started"
 
     # Now point resolv.conf at dnsmasq (safe — dnsmasq is already listening)
+    # After disabling systemd-resolved, resolv.conf may be a dangling symlink
+    # (points to ../run/systemd/resolve/stub-resolv.conf which no longer exists).
+    # Bash can't redirect through a dangling symlink, so remove it first.
     if ! grep -q "^nameserver 127.0.0.1" /etc/resolv.conf 2>/dev/null; then
-        cp /etc/resolv.conf /etc/resolv.conf.bak-$(date +%Y%m%d%H%M%S) 2>/dev/null || true
+        if [[ -L /etc/resolv.conf ]]; then
+            rm -f /etc/resolv.conf
+        elif [[ -f /etc/resolv.conf ]]; then
+            cp /etc/resolv.conf /etc/resolv.conf.bak-$(date +%Y%m%d%H%M%S) 2>/dev/null || true
+        fi
         echo "nameserver 127.0.0.1" > /etc/resolv.conf
         ok "resolv.conf updated to use dnsmasq"
     fi
