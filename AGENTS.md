@@ -161,8 +161,8 @@ After add/remove, the CLI restarts bird-route-manager which regenerates the conf
 **Generated BIRD2 config** (`bgphub-peers.conf`):
 ```bird
 filter bgphub_export {
-    if proto = "bgp_feed" then { bgp_next_hop = 10.8.3.1; accept; }
-    if proto = "user_vpn" then { bgp_next_hop = 10.8.3.1; accept; }
+    if proto = "bgp_feed" then { bgp_next_hop = 10.8.3.0; accept; }
+    if proto = "user_vpn" then { bgp_next_hop = 10.8.3.0; accept; }
     reject;
 }
 

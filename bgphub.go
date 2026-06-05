@@ -22,7 +22,7 @@ import (
 type BGPHubConfig struct {
 	Enabled      bool
 	WorkDir      string
-	Nexthop      string   // sentinel IP for bgp_next_hop rewrite (e.g. 10.8.3.1)
+	Nexthop      string   // sentinel IP for bgp_next_hop rewrite (e.g. 10.8.3.0)
 	LocalAS      int      // AS number for the hub side of each peer session
 	ExportProtos []string // BIRD2 protocol names to re-export (e.g. bgp_feed, user_vpn)
 }
@@ -30,7 +30,7 @@ type BGPHubConfig struct {
 func bgphubConfigFromEnv(workDir string) BGPHubConfig {
 	enabled := os.Getenv("BGPHUB_ENABLED") == "true"
 	localAS := envOrInt("BGPHUB_LOCAL_AS", 0)
-	nexthop := envOr("BGPHUB_NEXTHOP", "10.8.3.1")
+	nexthop := envOr("BGPHUB_NEXTHOP", "10.8.3.0")
 
 	protos := "bgp_feed,user_vpn"
 	if v := os.Getenv("BGPHUB_EXPORT_PROTOS"); v != "" {
