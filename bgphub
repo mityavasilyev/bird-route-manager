@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# bgphub — manage downstream BGP peers for bird-route-manager's BGP Hub.
+#
+# Usage:
+#   bgphub add <name> <ip> <as>   — register a new downstream peer
+#   bgphub remove <ip>            — remove a peer by IP
+#   bgphub list                   — show registered peers
+#
+# After add/remove, restarts bird-route-manager which regenerates the
+# BIRD2 config and reloads BGP sessions.
+
+set -euo pipefail
+
+WORK_DIR="${BGPHUB_WORK_DIR:-/opt/bird-route-manager}"
+PEERS_FILE="$WORK_DIR/bgphub-peers.json"
+
+# Source env file to pick up custom BGPHUB_ALLOWED_SUBNET if configured
+if [[ -f "$WORK_DIR/env" ]]; then
+    _subnet=$(grep "^BGPHUB_ALLOWED_SUBNET=" "$WORK_DIR/env" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
+    [[ -n "$_subnet" ]] && BGPHUB_ALLOWED_SUBNET="$_subnet"
+fi
+ALLOWED_SUBNET="${BGPHUB_ALLOWED_SUBNET:-10.8.3.0/24}"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'
+BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+
+die() { echo -e "${RED}Error:${RESET} $*" >&2; exit 1; }
+ok()  { echo -e "  ${GREEN}✓${RESET} $*"; }
+
+usage() {
+    echo "Usage:"
+    echo "  bgphub add <name> <ip> <as>   — register a downstream BGP peer"
+    echo "  bgphub remove <ip>            — remove a peer by IP"
+    echo "  bgphub list                   — show registered peers"
+    echo ""
+    echo "Environment:"
+    echo "  BGPHUB_WORK_DIR         Work directory (default: /opt/bird-route-manager)"
+    echo "  BGPHUB_ALLOWED_SUBNET   Restrict peer IPs to this subnet (default: 10.8.3.0/24)"
+    exit 1
+}
+
+validate_ip() {
+    local ip="$1"
+    python3 - "$ip" "$ALLOWED_SUBNET" <<'PYEOF'
+import ipaddress, sys
+ip, subnet = sys.argv[1], sys.argv[2]
+try:
+    addr = ipaddress.ip_address(ip)
+except ValueError:
+    print(f"Invalid IP address: {ip}", file=sys.stderr)
+    sys.exit(1)
+net = ipaddress.ip_network(subnet, strict=False)
+if addr not in net:
+    print(f"IP {ip} not in allowed subnet {subnet}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+validate_as() {
+    local as="$1"
+    if ! [[ "$as" =~ ^[0-9]+$ ]] || (( as < 1 || as > 4294967294 )); then
+        die "Invalid AS number: $as (must be 1–4294967294)"
+    fi
+}
+
+validate_name() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        die "Peer name cannot be empty"
+    fi
+}
+
+ensure_peers_file() {
+    if [[ ! -f "$PEERS_FILE" ]]; then
+        echo '{"peers":[]}' > "$PEERS_FILE"
+    fi
+}
+
+cmd_add() {
+    [[ $# -eq 3 ]] || { echo "Usage: bgphub add <name> <ip> <as>"; exit 1; }
+    local name="$1" ip="$2" as="$3"
+
+    validate_name "$name"
+    validate_ip "$ip"
+    validate_as "$as"
+    ensure_peers_file
+
+    python3 - "$PEERS_FILE" "$name" "$ip" "$as" <<'PYEOF'
+import json, re, sys
+
+peers_file, name, ip, as_num = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+
+with open(peers_file) as f:
+    data = json.load(f)
+
+peers = data.get('peers', [])
+
+# Check duplicate IP
+for p in peers:
+    if p['ip'] == ip:
+        print(f"Error: peer with IP {ip} already exists (name: {p['name']})", file=sys.stderr)
+        sys.exit(1)
+
+# Check duplicate protocol name
+def sanitize(n):
+    s = re.sub(r'[^a-z0-9]+', '_', n.lower()).strip('_') or 'peer'
+    return ('bgphub_' + s)[:64]
+
+new_proto = sanitize(name)
+for p in peers:
+    if sanitize(p['name']) == new_proto:
+        print(f"Error: name '{name}' conflicts with existing peer '{p['name']}' (both produce BIRD name {new_proto})", file=sys.stderr)
+        sys.exit(1)
+
+peers.append({'name': name, 'ip': ip, 'as': as_num})
+data['peers'] = peers
+
+with open(peers_file, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+PYEOF
+    ok "Added peer ${BOLD}$name${RESET} ($ip AS$as)"
+    reload_service
+}
+
+cmd_remove() {
+    [[ $# -eq 1 ]] || { echo "Usage: bgphub remove <ip>"; exit 1; }
+    local ip="$1"
+    ensure_peers_file
+
+    python3 - "$PEERS_FILE" "$ip" <<'PYEOF'
+import json, sys
+
+peers_file, ip = sys.argv[1], sys.argv[2]
+
+with open(peers_file) as f:
+    data = json.load(f)
+
+peers = data.get('peers', [])
+new_peers = [p for p in peers if p['ip'] != ip]
+
+if len(new_peers) == len(peers):
+    print(f"Error: no peer with IP {ip}", file=sys.stderr)
+    sys.exit(1)
+
+removed = [p for p in peers if p['ip'] == ip][0]
+data['peers'] = new_peers
+
+with open(peers_file, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+
+print(f"Removed {removed['name']} ({removed['ip']} AS{removed['as']})")
+PYEOF
+    reload_service
+}
+
+cmd_list() {
+    ensure_peers_file
+    python3 - "$PEERS_FILE" <<'PYEOF'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+peers = data.get('peers', [])
+if not peers:
+    print('  No peers configured.')
+else:
+    print(f"  {'Name':<20} {'IP':<18} {'AS':<10}")
+    print(f"  {'─'*20} {'─'*18} {'─'*10}")
+    for p in peers:
+        print(f"  {p['name']:<20} {p['ip']:<18} AS{p['as']}")
+    print(f"\n  {len(peers)} peer(s) total.")
+PYEOF
+}
+
+reload_service() {
+    echo "  Restarting bird-route-manager..."
+    if systemctl restart bird-route-manager 2>/dev/null; then
+        ok "Service restarted — BIRD2 config regenerated"
+    else
+        echo -e "  ${RED}!${RESET} Service restart failed. Check: journalctl -u bird-route-manager -n 20"
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+[[ $# -ge 1 ]] || usage
+
+case "$1" in
+    add)    shift; cmd_add "$@" ;;
+    remove) shift; cmd_remove "$@" ;;
+    list)   cmd_list ;;
+    -h|--help|help) usage ;;
+    *) die "Unknown command: $1. Run 'bgphub --help' for usage." ;;
+esac

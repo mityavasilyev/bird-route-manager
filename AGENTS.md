@@ -20,6 +20,9 @@ The intended use case: a Russian VPS running AmneziaWG/WireGuard as a VPN exit. 
 | `fullvpn.go` | Full-VPN per-peer override module — separate executor, state, handlers |
 | `main_test.go` | Unit + e2e tests for core features — all system calls faked |
 | `fullvpn_test.go` | Tests for fullvpn module — fakeFullVPNExecutor |
+| `bgphub.go` | BGP Hub module — route redistribution to downstream BIRD2 peers |
+| `bgphub_test.go` | Tests for bgphub module |
+| `bgphub` | CLI script for managing downstream BGP peers (installed to `/usr/local/bin/bgphub`) |
 | `go.mod` | `go 1.25`, module `github.com/mityavasilyev/bird-route-manager` |
 | `install.sh` | Interactive idempotent installer — the user-facing entry point |
 | `TODO.md` | What has NOT been tested on real hardware — read before shipping |
@@ -45,6 +48,13 @@ HTTP push  ─→  Handler  ─→  Manager.Update()  ─→  resolveEntries()  
                   │    peers.json
                   │
                   └─→  FullVPNManager.HandlePeers()
+
+(on startup, before LoadState)
+  bgphubConfigFromEnv()  ─→  EnsureBGPHubConf()
+       │                          │
+  bgphub-peers.json ──→ GenerateBGPHubConf() ──→ atomicWrite(bgphub-peers.conf) ──→ BirdConfigure()
+       │
+  (managed by bgphub CLI script — no HTTP API)
 ```
 
 Three injectable interfaces make everything testable without BIRD2 or real networking:
@@ -130,6 +140,50 @@ When `FULLVPN_ENABLED=true`, the service can temporarily route individual VPN pe
 **One-time host setup** (handled by `install.sh` + service startup):
 - `/etc/iproute2/rt_tables` gets `100 fulltunnel` entry (install.sh, persistent)
 - Service calls `EnsureRouteSetup()` on startup to set runtime routes + MASQUERADE (idempotent)
+
+---
+
+## BGP Hub — route redistribution to downstream peers (optional)
+
+When `BGPHUB_ENABLED=true`, the service generates a BIRD2 config file (`bgphub-peers.conf`) that re-exports `bgp_feed` + `user_vpn` routes to downstream BIRD2 peers. This lets a central VPS act as a BGP route hub for home routers and other clients connected via VPN.
+
+**How it works:** On startup, the service reads `bgphub-peers.json` (managed by the `bgphub` CLI), generates `bgphub-peers.conf` with an export filter and per-peer protocol blocks, writes it atomically, and calls `birdc configure`. The generated config is included from `bird-extra.conf`.
+
+**No HTTP API.** Peers are managed via the `bgphub` CLI on the VPS:
+```bash
+bgphub add home-router 10.8.3.8 64998   # register a peer
+bgphub remove 10.8.3.8                   # remove by IP
+bgphub list                               # show all peers
+```
+
+After add/remove, the CLI restarts bird-route-manager which regenerates the config.
+
+**Generated BIRD2 config** (`bgphub-peers.conf`):
+```bird
+filter bgphub_export {
+    if proto = "bgp_feed" then { bgp_next_hop = 10.8.3.1; accept; }
+    if proto = "user_vpn" then { bgp_next_hop = 10.8.3.1; accept; }
+    reject;
+}
+
+protocol bgp bgphub_home_router {
+    local as 64999;
+    neighbor 10.8.3.8 as 64998;
+    hold time 240;
+    ipv4 {
+        import none;
+        export filter bgphub_export;
+    };
+}
+```
+
+**Config:** `BGPHUB_ENABLED`, `BGPHUB_NEXTHOP` (sentinel IP for downstream peers, typically the VPS's VPN IP), `BGPHUB_LOCAL_AS`, `BGPHUB_EXPORT_PROTOS` (comma-separated protocol names), `BGPHUB_ALLOWED_SUBNET` (used by CLI for validation).
+
+**Client setup:** Downstream clients use `install.sh` as-is — they just enter the hub VPS's VPN IP as the BGP peer and the hub's AS number. No client-side code changes needed.
+
+**State files:**
+- `bgphub-peers.json` — peer list (managed by CLI)
+- `bgphub-peers.conf` — generated BIRD2 config (managed by service)
 
 ---
 

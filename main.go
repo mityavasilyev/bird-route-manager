@@ -798,6 +798,17 @@ func main() {
 	if err := mgr.EnsureFiles(); err != nil {
 		log.Fatalf("ensure files: %v", err)
 	}
+
+	// BGP Hub — generate downstream peer config before LoadState (which
+	// calls birdc configure). This ensures bgphub-peers.conf is ready
+	// for the first BIRD2 reload.
+	bgpHubCfg := bgphubConfigFromEnv(cfg.WorkDir)
+	if bgpHubCfg.Enabled {
+		if err := EnsureBGPHubConf(bgpHubCfg, sysExec.BirdConfigure); err != nil {
+			log.Printf("bgphub: warning: %v", err)
+		}
+	}
+
 	mgr.LoadState()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

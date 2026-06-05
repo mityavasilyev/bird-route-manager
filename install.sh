@@ -514,6 +514,54 @@ else
     FULLVPN_CLEANUP="$CURRENT_FULLVPN_CLEANUP"
 fi
 
+# ── BGP Hub — route redistribution to downstream peers (optional) ──
+
+note "Re-export BGP + user routes to downstream VPN peers via BGP."
+note "Downstream clients (e.g. home router) peer with this VPS and receive"
+note "split-routing prefixes. Peers are managed via the bgphub CLI."
+echo ""
+
+CURRENT_BGPHUB=$(env_get "BGPHUB_ENABLED" "")
+CURRENT_BGPHUB_SUBNET=$(env_get "BGPHUB_ALLOWED_SUBNET" "10.8.3.0/24")
+CURRENT_BGPHUB_NEXTHOP=$(env_get "BGPHUB_NEXTHOP" "10.8.3.1")
+CURRENT_BGPHUB_LOCAL_AS=$(env_get "BGPHUB_LOCAL_AS" "$BGP_LOCAL_AS")
+CURRENT_BGPHUB_PROTOS=$(env_get "BGPHUB_EXPORT_PROTOS" "bgp_feed,user_vpn")
+ENABLE_BGPHUB=false
+CHANGE_BGPHUB=true
+
+if [[ "$CURRENT_BGPHUB" == "true" ]]; then
+    echo -e "  BGP Hub: ${CYAN}enabled${RESET} (nexthop: ${CURRENT_BGPHUB_NEXTHOP}, subnet: ${CURRENT_BGPHUB_SUBNET})"
+    ask_yn "Change settings?" n && CHANGE_BGPHUB=true || CHANGE_BGPHUB=false
+    ENABLE_BGPHUB=true
+else
+    echo -e "  BGP Hub: ${DIM}disabled${RESET}"
+fi
+
+if $CHANGE_BGPHUB; then
+    if [[ "$CURRENT_BGPHUB" == "true" ]]; then
+        _bgphub_default="y"
+    else
+        _bgphub_default="n"
+    fi
+    if ask_yn "Enable BGP Hub (route redistribution to VPN peers)?" "$_bgphub_default"; then
+        ENABLE_BGPHUB=true
+        echo ""
+        BGPHUB_NEXTHOP=$(ask "Nexthop IP for downstream peers (this VPS's VPN IP)" "$CURRENT_BGPHUB_NEXTHOP")
+        BGPHUB_LOCAL_AS=$(ask "Local AS for downstream sessions" "$CURRENT_BGPHUB_LOCAL_AS")
+        BGPHUB_SUBNET=$(ask "Allowed peer subnet" "$CURRENT_BGPHUB_SUBNET")
+        BGPHUB_PROTOS=$(ask "Protocols to re-export (comma-separated)" "$CURRENT_BGPHUB_PROTOS")
+        ok "BGP Hub: nexthop ${BGPHUB_NEXTHOP}, AS${BGPHUB_LOCAL_AS}, subnet ${BGPHUB_SUBNET}"
+    else
+        ENABLE_BGPHUB=false
+        ok "BGP Hub: disabled"
+    fi
+else
+    BGPHUB_NEXTHOP="$CURRENT_BGPHUB_NEXTHOP"
+    BGPHUB_LOCAL_AS="$CURRENT_BGPHUB_LOCAL_AS"
+    BGPHUB_SUBNET="$CURRENT_BGPHUB_SUBNET"
+    BGPHUB_PROTOS="$CURRENT_BGPHUB_PROTOS"
+fi
+
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,6 +615,13 @@ ok "Installed: $BINARY"
 touch -a "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 chmod 644 "$WORK_DIR/user-vpn.list" "$WORK_DIR/user-isp.list"
 ok "Route list files ready"
+
+# 5c1b — BGP Hub empty include file (BIRD2 must not fail on missing include)
+if $ENABLE_BGPHUB; then
+    touch -a "$WORK_DIR/bgphub-peers.conf"
+    chmod 644 "$WORK_DIR/bgphub-peers.conf"
+    ok "BGP Hub include file ready"
+fi
 
 # 5c2 — IP check sites list
 if $INSTALL_IP_CHECK_SITES; then
@@ -728,6 +783,16 @@ elif [[ -z "$CURRENT_TOKEN" ]]; then
     env_set "SYNC_TOKEN" ""
 fi
 
+if $ENABLE_BGPHUB; then
+    env_set "BGPHUB_ENABLED"        "true"
+    env_set "BGPHUB_NEXTHOP"        "$BGPHUB_NEXTHOP"
+    env_set "BGPHUB_LOCAL_AS"       "$BGPHUB_LOCAL_AS"
+    env_set "BGPHUB_ALLOWED_SUBNET" "$BGPHUB_SUBNET"
+    env_set "BGPHUB_EXPORT_PROTOS"  "$BGPHUB_PROTOS"
+else
+    env_set "BGPHUB_ENABLED" ""
+fi
+
 if $ENABLE_FULLVPN; then
     env_set "FULLVPN_ENABLED"      "true"
     env_set "AWG_CONTAINER"        "$AWG_CONTAINER"
@@ -751,6 +816,50 @@ if $ENABLE_FULLVPN; then
         ok "Added fulltunnel routing table to /etc/iproute2/rt_tables"
     else
         ok "fulltunnel routing table already configured"
+    fi
+fi
+
+# 5d3 — BGP Hub CLI script + UFW + MASQUERADE
+if $ENABLE_BGPHUB; then
+    install -m 755 "$SCRIPT_DIR/bgphub" /usr/local/bin/bgphub
+    ok "bgphub CLI installed: /usr/local/bin/bgphub"
+
+    # UFW rule: allow BGP from VPN peers
+    if command -v ufw &>/dev/null; then
+        if ! ufw status 2>/dev/null | grep -q "179/tcp.*${BGPHUB_SUBNET}"; then
+            ufw allow from "$BGPHUB_SUBNET" to any port 179 proto tcp comment 'BGP Hub peers' > /dev/null 2>&1
+            ok "UFW: allowed BGP from $BGPHUB_SUBNET"
+        else
+            ok "UFW: BGP rule already present"
+        fi
+    fi
+
+    # MASQUERADE: downstream peer traffic exiting via the upstream VPN tunnel
+    # needs NAT so return traffic comes back to this VPS (not to the peer directly).
+    if ! iptables -t nat -C POSTROUTING -s "$BGPHUB_SUBNET" -o "$VPN_INTERFACE" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s "$BGPHUB_SUBNET" -o "$VPN_INTERFACE" -j MASQUERADE
+        ok "MASQUERADE: $BGPHUB_SUBNET → $VPN_INTERFACE"
+    else
+        ok "MASQUERADE rule already present"
+    fi
+
+    # Persist the MASQUERADE rule across reboots
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save > /dev/null 2>&1
+        ok "iptables rules saved"
+    elif command -v iptables-save &>/dev/null; then
+        # Save to a file that iptables-persistent can restore
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        if ! dpkg -l iptables-persistent 2>/dev/null | grep -q "^ii"; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q iptables-persistent > /dev/null 2>&1
+            ok "iptables-persistent installed for rule persistence"
+        else
+            ok "iptables rules saved"
+        fi
+    else
+        warn "Could not persist iptables rules — MASQUERADE will be lost on reboot"
+        note "Install iptables-persistent: apt install iptables-persistent"
     fi
 fi
 
@@ -783,6 +892,13 @@ protocol static dnsmasq_isp {
     include "$WORK_DIR/dnsmasq-isp.list";
 }
 DNSMASQEOF
+    fi
+
+    if $ENABLE_BGPHUB; then
+        echo ""
+        echo "# BGP Hub — peer configs generated by bird-route-manager at runtime."
+        echo "# Peers are managed via the bgphub CLI: bgphub add|remove|list"
+        echo "include \"$WORK_DIR/bgphub-peers.conf\";"
     fi
 } > "$BIRD_EXTRA_CONF"
 ok "BIRD2 protocol config written"
@@ -1092,6 +1208,11 @@ if $ENABLE_FULLVPN; then
     echo -e "  Full-VPN:       ${CYAN}enabled${RESET} (container: ${AWG_CONTAINER}, duration: ${FULLVPN_DURATION}s)"
 else
     echo -e "  Full-VPN:       ${DIM}disabled${RESET}"
+fi
+if $ENABLE_BGPHUB; then
+    echo -e "  BGP Hub:        ${CYAN}enabled${RESET} (nexthop: ${BGPHUB_NEXTHOP}, AS${BGPHUB_LOCAL_AS}, subnet: ${BGPHUB_SUBNET})"
+else
+    echo -e "  BGP Hub:        ${DIM}disabled${RESET}"
 fi
 echo -e "  Config:         ${CYAN}$ENV_FILE${RESET}"
 
