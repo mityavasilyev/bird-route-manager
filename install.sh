@@ -1116,11 +1116,17 @@ else
     note "Check later: birdc show protocols bgp_feed"
 fi
 
-# Verify bird-route-manager HTTP API
-HTTP_CODE=$(curl -s --max-time 3 -o /dev/null -w "%{http_code}" \
-    -X POST http://127.0.0.1:8081/api/v1/routes \
-    -H "Content-Type: application/json" \
-    -d '{}' 2>/dev/null || true)
+# Verify bird-route-manager HTTP API (retry a few times — on 1-vCPU boxes the
+# service resolves all routes before opening the listener, which can take seconds)
+HTTP_CODE="000"
+for i in 1 2 3 4 5; do
+    HTTP_CODE=$(curl -s --max-time 3 -o /dev/null -w "%{http_code}" \
+        -X POST http://127.0.0.1:8081/api/v1/routes \
+        -H "Content-Type: application/json" \
+        -d '{}' 2>/dev/null || true)
+    [[ "$HTTP_CODE" != "000" ]] && break
+    sleep 2
+done
 
 if [[ "$HTTP_CODE" =~ ^(401|503)$ ]]; then
     ok "bird-route-manager API is up (HTTP $HTTP_CODE as expected)"
