@@ -820,15 +820,21 @@ func main() {
 	var fvpnMgr *FullVPNManager
 	fvpnCfg := fullvpnConfigFromEnv(cfg.WorkDir, cfg.VPNInterface)
 	if fvpnCfg.Enabled {
-		fvpnMgr = NewFullVPNManager(fvpnCfg, systemFullVPNExecutor{})
+		kernel := DetectWgMode(fvpnCfg.WgInterface)
+		if kernel {
+			log.Printf("fullvpn: detected kernel mode (awg/wg on host)")
+		} else {
+			log.Printf("fullvpn: detected docker mode (container=%s)", fvpnCfg.ContainerName)
+		}
+		fvpnMgr = NewFullVPNManager(fvpnCfg, systemFullVPNExecutor{kernelMode: kernel})
 		fvpnMgr.LoadPeers()
 		if err := fvpnMgr.Setup(); err != nil {
 			log.Printf("fullvpn: route setup warning: %v", err)
 		}
 		fvpnMgr.LoadState()
 		fvpnMgr.StartCleanupTicker(ctx)
-		log.Printf("fullvpn: enabled (container=%s, duration=%v, cleanup=%v)",
-			fvpnCfg.ContainerName, fvpnCfg.OverrideDuration, fvpnCfg.CleanupInterval)
+		log.Printf("fullvpn: enabled (duration=%v, cleanup=%v)",
+			fvpnCfg.OverrideDuration, fvpnCfg.CleanupInterval)
 	}
 
 	srv := &http.Server{

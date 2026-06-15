@@ -43,8 +43,8 @@ HTTP push  ─→  Handler  ─→  Manager.Update()  ─→  resolveEntries()  
                   │  (on ticker)  Refresh()  ─→  same resolve → write → reload path
                   │
                   ├─→  FullVPNManager.HandleFullVPN()  ─→  Enable/Disable  ─→  FullVPNExecutor
-                  │         │                                                   (nsenter, ip rule,
-                  │    fullvpn-state.json                                        docker exec)
+                  │         │                                                   kernel: awg show, ip rule
+                  │    fullvpn-state.json                                        docker: nsenter, docker exec
                   │    peers.json
                   │
                   └─→  FullVPNManager.HandlePeers()
@@ -119,13 +119,22 @@ When `DNSMASQ_IPSET` env var is set, the service reads a kernel ipset on every a
 
 ## Full-VPN per-peer override (optional)
 
-When `FULLVPN_ENABLED=true`, the service can temporarily route individual VPN peers through the VPN tunnel for ALL traffic (bypassing split routing). Designed for AmneziaWG running in Docker.
+When `FULLVPN_ENABLED=true`, the service can temporarily route individual VPN peers through the VPN tunnel for ALL traffic (bypassing split routing).
 
-**The problem:** The AmneziaWG container masquerades all peer traffic (`10.8.3.0/24 → 172.29.172.2`) before it reaches the host, so the host can't distinguish peers for routing.
+**Dual-mode support (kernel + Docker):** The fullvpn module works with AmneziaWG in both configurations:
 
-**The solution:** For override-active peers, `nsenter` adds a transient NAT bypass rule in the container's network namespace (`iptables -t nat -I POSTROUTING -s <peer_ip> -o eth1 -j RETURN`), then a host `ip rule from <peer_ip> table fulltunnel` routes that peer via the VPN tunnel. These rules are ephemeral — lost on container restart — and the cleanup ticker re-applies them every 3 minutes.
+| | Docker mode | Kernel mode |
+|---|---|---|
+| **WG interface** | Inside container (`docker exec wg show`) | On host (`awg show wg0`) |
+| **NAT bypass** | `nsenter` iptables RETURN in container netns | No-op — traffic keeps original source IP |
+| **Route setup** | Bridge route + host MASQUERADE | Only fulltunnel table route (PostUp handles MASQUERADE) |
+| **Detection** | Container running, `awg show` fails on host | `awg show <iface>` succeeds on host |
 
-**Module structure:** `fullvpn.go` is a self-contained module with its own `FullVPNExecutor` interface (separate from the main `Executor`), state management, and HTTP handlers. All container interaction is isolated in the executor, so if the container setup changes, only the executor implementation needs updating.
+Mode is auto-detected at startup via `DetectWgMode()` and locked for the process lifetime. The `FullVPNExecutor` interface handles both — `ContainerPID()` returns 0 as a sentinel in kernel mode, and `NATBypass()` is a no-op when `kernelMode` is set. **After switching WireGuard mode with `awg-mode`, restart `bird-route-manager.service` to re-detect.**
+
+**Why kernel mode doesn't need NAT bypass:** In Docker mode, the container masquerades all peer traffic (`10.8.3.x → 172.29.172.2`) before it reaches the host, so the host can't distinguish peers. The NAT bypass rule makes the container skip masquerade for a specific peer. In kernel mode, wg0 is on the host — traffic arrives with the peer's original source IP, so `ip rule from <peer_ip>` works directly without any NAT manipulation.
+
+**Module structure:** `fullvpn.go` is a self-contained module with its own `FullVPNExecutor` interface (separate from the main `Executor`), state management, and HTTP handlers. All system interaction is isolated in the executor — mode-specific behavior lives in `systemFullVPNExecutor`.
 
 **State files:**
 - `peers.json` — name→pubkey mapping, managed via `POST /api/v1/peers`
@@ -135,11 +144,11 @@ When `FULLVPN_ENABLED=true`, the service can temporarily route individual VPN pe
 - `POST /api/v1/fullvpn` — enable/disable/list overrides
 - `POST /api/v1/peers` — set/list peer name→pubkey mappings
 
-**Config:** `FULLVPN_ENABLED`, `AWG_CONTAINER`, `AWG_WG_INTERFACE`, `AWG_CONTAINER_IFACE`, `FULLVPN_TABLE`, `FULLVPN_DURATION` (seconds), `FULLVPN_CLEANUP` (seconds), `FULLVPN_SUBNET`, `FULLVPN_BRIDGE`, `FULLVPN_BRIDGE_IP`.
+**Config:** `FULLVPN_ENABLED`, `AWG_CONTAINER`, `AWG_WG_INTERFACE`, `AWG_CONTAINER_IFACE`, `FULLVPN_TABLE`, `FULLVPN_DURATION` (seconds), `FULLVPN_CLEANUP` (seconds), `FULLVPN_SUBNET`, `FULLVPN_BRIDGE`, `FULLVPN_BRIDGE_IP`. Docker-specific settings (`AWG_CONTAINER`, `AWG_CONTAINER_IFACE`, `FULLVPN_BRIDGE`, `FULLVPN_BRIDGE_IP`) are ignored in kernel mode.
 
 **One-time host setup** (handled by `install.sh` + service startup):
 - `/etc/iproute2/rt_tables` gets `100 fulltunnel` entry (install.sh, persistent)
-- Service calls `EnsureRouteSetup()` on startup to set runtime routes + MASQUERADE (idempotent)
+- Service calls `EnsureRouteSetup()` on startup: sets default route in fulltunnel table via VPN interface. In Docker mode also sets bridge route + MASQUERADE. In kernel mode, PostUp in wg0.conf already handles MASQUERADE.
 
 ---
 
@@ -190,7 +199,7 @@ protocol bgp bgphub_home_router {
 ## Testing
 
 ```bash
-go test -race ./...   # all 65 tests, ~1.5s
+go test -race ./...   # ~1.5s
 go vet ./...
 ```
 

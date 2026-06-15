@@ -1,18 +1,21 @@
 // fullvpn.go — per-peer full-VPN override module.
 //
 // Temporarily routes individual VPN peers through the VPN tunnel for all traffic
-// (bypassing split routing) for a configurable duration. Designed for AmneziaWG
-// running in Docker, where the container masquerades peer traffic.
+// (bypassing split routing) for a configurable duration.
 //
-// How it works:
-//   - Reads peer pubkey→IP mapping via `docker exec ... wg show`
-//   - Bypasses container NAT for the peer via `nsenter ... iptables` (transient rule)
-//   - Adds host `ip rule` to route that peer's traffic via the VPN tunnel
-//   - A cleanup ticker expires overrides and re-applies active ones (survives restarts)
+// Supports two WireGuard modes:
+//   - Docker mode: AmneziaWG container running, peers queried via `docker exec wg show`.
+//     Container masquerades all peer traffic, so a NAT bypass rule is injected via
+//     `nsenter` into the container's network namespace.
+//   - Kernel mode: AmneziaWG kernel module (`awg-quick@wg0`), no container running.
+//     Peers queried via `awg show` on the host. No NAT bypass needed — traffic keeps
+//     the peer's original source IP, so `ip rule from <peerIP>` works directly.
 //
-// Container interaction is read-only at the application layer — the only write is
-// a transient iptables NAT bypass rule in the container's network namespace, which
-// vanishes on container restart. The cleanup ticker re-applies it.
+// Mode is auto-detected at startup: if `awg show <iface>` succeeds on the host,
+// kernel mode is used; otherwise falls back to Docker.
+//
+// In both modes the `ip rule` + routing table mechanism is identical — only the
+// peer discovery and NAT handling differ.
 package main
 
 import (
@@ -37,32 +40,76 @@ import (
 // FullVPNExecutor abstracts system commands for the full-VPN feature.
 // Separate from the main Executor to keep concerns isolated.
 type FullVPNExecutor interface {
-	// WgPeers returns a pubkey→IP mapping from the WG interface inside a container.
+	// WgPeers returns a pubkey→IP mapping from the WG interface.
+	// In kernel mode, queries the host directly; in Docker mode, uses docker exec.
 	WgPeers(container, iface string) (map[string]string, error)
 	// ContainerPID returns the PID of the container's init process.
+	// In kernel mode, returns (0, nil) — the sentinel value signals that NAT bypass
+	// is not needed (traffic keeps original source IP on the host).
 	ContainerPID(container string) (int, error)
 	// NATBypass adds or removes a RETURN rule in the container's NAT POSTROUTING
 	// chain, causing the container to skip masquerade for this peer's traffic.
+	// When pid == 0 (kernel mode), this is a no-op — no container NAT to bypass.
 	NATBypass(pid int, peerIP, containerIface string, add bool) error
 	// PolicyRule adds or removes a source-based ip rule on the host.
 	PolicyRule(peerIP, table string, add bool) error
 	// EnsureRouteSetup idempotently sets up the host routing infrastructure:
 	//   - default route in the named table via vpnIface
-	//   - host route for subnet via bridgeIP on bridgeName
-	//   - MASQUERADE for subnet traffic leaving via non-bridge interfaces
+	//   - (Docker mode only) host route for subnet via bridgeIP on bridgeName
+	//   - (Docker mode only) MASQUERADE for subnet traffic leaving via non-bridge interfaces
 	EnsureRouteSetup(table, vpnIface, subnet, bridgeName, bridgeIP string) error
 }
 
 // ── Real executor ───────────────────────────────────────────────────────────
 
-type systemFullVPNExecutor struct{}
+type systemFullVPNExecutor struct {
+	kernelMode bool // true = awg/wg on host; false = docker exec
+}
 
-func (systemFullVPNExecutor) WgPeers(container, iface string) (map[string]string, error) {
+// DetectWgMode checks whether the WireGuard interface is running on the host
+// (kernel mode) or inside a Docker container. Returns true for kernel mode.
+func DetectWgMode(iface string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// awg is the AmneziaWG userspace tool; if awg-quick brought up the
+	// interface via kernel module, `awg show <iface>` succeeds.
+	if exec.CommandContext(ctx, "awg", "show", iface).Run() == nil {
+		return true
+	}
+	// Fall back to standard wg (non-Amnezia kernel module).
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	return exec.CommandContext(ctx2, "wg", "show", iface).Run() == nil
+}
+
+func (e systemFullVPNExecutor) WgPeers(container, iface string) (map[string]string, error) {
+	if e.kernelMode {
+		return hostWgPeers(iface)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "exec", container, "wg", "show", iface, "allowed-ips").Output()
 	if err != nil {
 		return nil, fmt.Errorf("docker exec wg show: %w", err)
+	}
+	return parseWgAllowedIPs(string(out)), nil
+}
+
+// hostWgPeers queries the WireGuard interface on the host (kernel mode).
+// Tries awg (AmneziaWG) first, then falls back to standard wg.
+func hostWgPeers(iface string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "awg", "show", iface, "allowed-ips").Output()
+	if err == nil {
+		return parseWgAllowedIPs(string(out)), nil
+	}
+	// Fall back to standard wg.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	out, err = exec.CommandContext(ctx2, "wg", "show", iface, "allowed-ips").Output()
+	if err != nil {
+		return nil, fmt.Errorf("host wg show %s: %w", iface, err)
 	}
 	return parseWgAllowedIPs(string(out)), nil
 }
@@ -95,7 +142,10 @@ func parseWgAllowedIPs(output string) map[string]string {
 	return peers
 }
 
-func (systemFullVPNExecutor) ContainerPID(container string) (int, error) {
+func (e systemFullVPNExecutor) ContainerPID(container string) (int, error) {
+	if e.kernelMode {
+		return 0, nil // sentinel: no container, NAT bypass not needed
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "inspect", container, "--format", "{{.State.Pid}}").Output()
@@ -123,7 +173,10 @@ func detectIptables(pid int) string {
 	return "iptables"
 }
 
-func (systemFullVPNExecutor) NATBypass(pid int, peerIP, containerIface string, add bool) error {
+func (e systemFullVPNExecutor) NATBypass(pid int, peerIP, containerIface string, add bool) error {
+	if e.kernelMode {
+		return nil // kernel mode: no container NAT to bypass
+	}
 	iptCmd := detectIptables(pid)
 
 	action := "-I"
@@ -157,7 +210,7 @@ func (systemFullVPNExecutor) NATBypass(pid int, peerIP, containerIface string, a
 	return nil
 }
 
-func (systemFullVPNExecutor) PolicyRule(peerIP, table string, add bool) error {
+func (e systemFullVPNExecutor) PolicyRule(peerIP, table string, add bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -191,22 +244,35 @@ func (systemFullVPNExecutor) PolicyRule(peerIP, table string, add bool) error {
 	return nil
 }
 
-func (systemFullVPNExecutor) EnsureRouteSetup(table, vpnIface, subnet, bridgeName, bridgeIP string) error {
-	// 1. Default route in the fullvpn table via the VPN interface
+func (e systemFullVPNExecutor) EnsureRouteSetup(table, vpnIface, subnet, bridgeName, bridgeIP string) error {
+	// 1. Default route in the fullvpn table via the VPN interface (both modes)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel1()
 	if out, err := exec.CommandContext(ctx1, "ip", "route", "replace", "default", "dev", vpnIface, "table", table).CombinedOutput(); err != nil {
+		if e.kernelMode {
+			// In kernel mode this is the only setup step — fail hard.
+			return fmt.Errorf("default route in table %s via %s: %w — %s", table, vpnIface, err, strings.TrimSpace(string(out)))
+		}
+		// In Docker mode, log and continue — bridge route + MASQUERADE below
+		// are still useful even if the VPN interface isn't up yet.
 		log.Printf("fullvpn: warn: default route in table %s: %v — %s", table, err, strings.TrimSpace(string(out)))
 	}
 
-	// 2. Host route for VPN subnet via container bridge IP
+	if e.kernelMode {
+		// Kernel mode: wg0 is on the host, PostUp already handles MASQUERADE.
+		// No bridge route or extra MASQUERADE needed.
+		log.Printf("fullvpn: route setup OK — kernel mode (table=%s, iface=%s)", table, vpnIface)
+		return nil
+	}
+
+	// 2. Host route for VPN subnet via container bridge IP (Docker mode only)
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	if out, err := exec.CommandContext(ctx2, "ip", "route", "replace", subnet, "via", bridgeIP, "dev", bridgeName).CombinedOutput(); err != nil {
 		return fmt.Errorf("host route for %s via %s dev %s: %w — %s", subnet, bridgeIP, bridgeName, err, strings.TrimSpace(string(out)))
 	}
 
-	// 3. MASQUERADE for VPN subnet traffic (idempotent: check first)
+	// 3. MASQUERADE for VPN subnet traffic (Docker mode only, idempotent: check first)
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel3()
 	checkErr := exec.CommandContext(ctx3, "iptables", "-t", "nat", "-C", "POSTROUTING",
@@ -220,7 +286,7 @@ func (systemFullVPNExecutor) EnsureRouteSetup(table, vpnIface, subnet, bridgeNam
 		}
 	}
 
-	log.Printf("fullvpn: route setup OK (table=%s, iface=%s, subnet=%s, bridge=%s via %s)", table, vpnIface, subnet, bridgeName, bridgeIP)
+	log.Printf("fullvpn: route setup OK — docker mode (table=%s, iface=%s, subnet=%s, bridge=%s via %s)", table, vpnIface, subnet, bridgeName, bridgeIP)
 	return nil
 }
 

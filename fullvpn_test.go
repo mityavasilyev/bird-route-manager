@@ -333,9 +333,6 @@ func TestDisable(t *testing.T) {
 	if natCalls < 2 {
 		t.Errorf("expected at least 2 NAT bypass calls (add+remove), got %d", natCalls)
 	}
-	if !lastNAT.Add == true {
-		// Last NAT call should be remove (add=false)
-	}
 	if lastNAT.Add {
 		t.Error("last NAT bypass call should be remove (add=false)")
 	}
@@ -344,6 +341,55 @@ func TestDisable(t *testing.T) {
 	}
 
 	// Override should be gone
+	if len(mgr.ActiveOverrides()) != 0 {
+		t.Error("expected 0 active overrides after disable")
+	}
+}
+
+// TestDisableOfflinePeer tests disabling a peer that has disconnected from WG
+// (not in `wg show` output) but has an active override in state.
+// The fallback path in Disable() searches state.Overrides by name.
+func TestDisableOfflinePeer(t *testing.T) {
+	mgr, exec := newTestFullVPNManager(t)
+
+	// Enable alice (she's in WG and peers registry)
+	_, _ = mgr.Enable("alice")
+
+	// Simulate alice going offline: remove her from WG peers
+	exec.mu.Lock()
+	delete(exec.wgPeers, "pubkey-alice")
+	exec.mu.Unlock()
+
+	// Disable should still work via state fallback
+	ip, err := mgr.Disable("alice")
+	if err != nil {
+		t.Fatalf("Disable offline peer: %v", err)
+	}
+	if ip != "10.8.3.2" {
+		t.Errorf("disabled IP = %q, want 10.8.3.2", ip)
+	}
+	if len(mgr.ActiveOverrides()) != 0 {
+		t.Error("expected 0 active overrides after disable")
+	}
+}
+
+func TestDisableOfflinePeerKernelMode(t *testing.T) {
+	mgr, exec := newTestFullVPNManagerKernel(t)
+
+	_, _ = mgr.Enable("alice")
+
+	// Simulate alice going offline
+	exec.mu.Lock()
+	delete(exec.wgPeers, "pubkey-alice")
+	exec.mu.Unlock()
+
+	ip, err := mgr.Disable("alice")
+	if err != nil {
+		t.Fatalf("Disable offline peer (kernel): %v", err)
+	}
+	if ip != "10.8.3.2" {
+		t.Errorf("disabled IP = %q, want 10.8.3.2", ip)
+	}
 	if len(mgr.ActiveOverrides()) != 0 {
 		t.Error("expected 0 active overrides after disable")
 	}
@@ -661,6 +707,278 @@ func TestHandlerPeersUnauthorized(t *testing.T) {
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", resp.StatusCode)
+	}
+}
+
+// ── Kernel mode tests ───────────────────────────────────────────────────────
+//
+// Kernel mode: WireGuard runs on the host via awg-quick (kernel module).
+// ContainerPID returns 0 (sentinel), NATBypass with pid=0 is a no-op.
+// Only PolicyRule is applied — no container NAT to bypass.
+
+// newTestFullVPNManagerKernel creates a manager with kernel-mode executor behavior:
+// ContainerPID returns (0, nil), simulating no Docker container.
+func newTestFullVPNManagerKernel(t *testing.T) (*FullVPNManager, *fakeFullVPNExecutor) {
+	t.Helper()
+	cfg := testFullVPNConfig(t)
+	exec := newFakeFullVPNExecutor()
+	exec.pid = 0 // kernel mode sentinel
+	mgr := NewFullVPNManager(cfg, exec)
+	mgr.peers = map[string]string{
+		"alice": "pubkey-alice",
+		"bob":   "pubkey-bob",
+	}
+	return mgr, exec
+}
+
+func TestEnableKernelMode(t *testing.T) {
+	mgr, exec := newTestFullVPNManagerKernel(t)
+
+	override, err := mgr.Enable("alice")
+	if err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if override.PeerName != "alice" || override.PeerIP != "10.8.3.2" {
+		t.Errorf("unexpected override: %+v", override)
+	}
+
+	// NAT bypass should still be called (with pid=0), but in the real executor
+	// it would be a no-op. The manager doesn't skip the call.
+	if exec.NATBypassCallCount() != 1 {
+		t.Errorf("expected 1 NAT bypass call, got %d", exec.NATBypassCallCount())
+	}
+	nat := exec.LastNATBypass()
+	if nat.PID != 0 {
+		t.Errorf("kernel mode: NAT bypass PID should be 0, got %d", nat.PID)
+	}
+
+	// Policy rule must still be applied (same in both modes)
+	if exec.PolicyRuleCallCount() != 1 {
+		t.Errorf("expected 1 policy rule call, got %d", exec.PolicyRuleCallCount())
+	}
+	pr := exec.LastPolicyRule()
+	if pr.PeerIP != "10.8.3.2" || !pr.Add {
+		t.Errorf("unexpected policy rule call: %+v", pr)
+	}
+}
+
+func TestDisableKernelMode(t *testing.T) {
+	mgr, exec := newTestFullVPNManagerKernel(t)
+
+	_, _ = mgr.Enable("alice")
+
+	ip, err := mgr.Disable("alice")
+	if err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+	if ip != "10.8.3.2" {
+		t.Errorf("disabled IP = %q, want 10.8.3.2", ip)
+	}
+
+	// Policy rule removal must happen
+	exec.mu.Lock()
+	lastPR := exec.policyRuleCalls[len(exec.policyRuleCalls)-1]
+	exec.mu.Unlock()
+	if lastPR.Add {
+		t.Error("last policy rule call should be remove (add=false)")
+	}
+
+	if len(mgr.ActiveOverrides()) != 0 {
+		t.Error("expected 0 active overrides after disable")
+	}
+}
+
+func TestCleanupKernelMode(t *testing.T) {
+	mgr, exec := newTestFullVPNManagerKernel(t)
+
+	_, _ = mgr.Enable("alice")
+
+	// Expire alice
+	mgr.mu.Lock()
+	o := mgr.state.Overrides["10.8.3.2"]
+	o.ExpiresAt = time.Now().Add(-1 * time.Minute)
+	mgr.state.Overrides["10.8.3.2"] = o
+	mgr.mu.Unlock()
+
+	mgr.Cleanup()
+
+	if len(mgr.ActiveOverrides()) != 0 {
+		t.Error("expected 0 active overrides after cleanup")
+	}
+
+	// Policy rule should have been removed
+	exec.mu.Lock()
+	lastPR := exec.policyRuleCalls[len(exec.policyRuleCalls)-1]
+	exec.mu.Unlock()
+	if lastPR.Add {
+		t.Error("cleanup should have removed policy rule")
+	}
+}
+
+func TestCleanupKernelModeReappliesActive(t *testing.T) {
+	mgr, exec := newTestFullVPNManagerKernel(t)
+
+	_, _ = mgr.Enable("alice")
+	natBefore := exec.NATBypassCallCount()
+	prBefore := exec.PolicyRuleCallCount()
+
+	mgr.Cleanup()
+
+	// Cleanup should re-apply both NAT bypass (no-op in kernel) and policy rule
+	if exec.NATBypassCallCount() <= natBefore {
+		t.Error("expected cleanup to re-apply NAT bypass call")
+	}
+	if exec.PolicyRuleCallCount() <= prBefore {
+		t.Error("expected cleanup to re-apply policy rule")
+	}
+
+	// NAT bypass should use pid=0
+	nat := exec.LastNATBypass()
+	if nat.PID != 0 {
+		t.Errorf("cleanup: NAT bypass PID should be 0, got %d", nat.PID)
+	}
+}
+
+func TestStatePersistenceKernelMode(t *testing.T) {
+	mgr, _ := newTestFullVPNManagerKernel(t)
+
+	_, _ = mgr.Enable("alice")
+
+	// Reload into new kernel-mode manager
+	cfg := testFullVPNConfig(t)
+	cfg.WorkDir = mgr.cfg.WorkDir
+	exec2 := newFakeFullVPNExecutor()
+	exec2.pid = 0 // kernel mode
+	mgr2 := NewFullVPNManager(cfg, exec2)
+	mgr2.peers = map[string]string{"alice": "pubkey-alice"}
+	mgr2.LoadState()
+
+	overrides := mgr2.ActiveOverrides()
+	if len(overrides) != 1 {
+		t.Fatalf("expected 1 override after reload, got %d", len(overrides))
+	}
+	if overrides[0].PeerName != "alice" {
+		t.Errorf("override name = %q, want alice", overrides[0].PeerName)
+	}
+}
+
+func TestEnableRollbackKernelMode(t *testing.T) {
+	mgr, exec := newTestFullVPNManagerKernel(t)
+	exec.policyRuleErr = fmt.Errorf("ip rule failed")
+
+	_, err := mgr.Enable("alice")
+	if err == nil {
+		t.Error("expected error when policy rule fails")
+	}
+
+	// Rollback calls NATBypass(0, ..., false) — should not panic or error
+	// even though it's a no-op in kernel mode.
+	exec.mu.Lock()
+	lastNAT := exec.natBypassCalls[len(exec.natBypassCalls)-1]
+	exec.mu.Unlock()
+	if lastNAT.Add {
+		t.Error("NAT bypass should have been rolled back (last call should be remove)")
+	}
+	if lastNAT.PID != 0 {
+		t.Errorf("rollback NAT bypass PID should be 0, got %d", lastNAT.PID)
+	}
+
+	// No overrides should be persisted
+	if len(mgr.ActiveOverrides()) != 0 {
+		t.Error("expected 0 overrides after failed enable")
+	}
+}
+
+func newTestFullVPNServerKernel(t *testing.T) (*httptest.Server, *FullVPNManager, *fakeFullVPNExecutor) {
+	t.Helper()
+	cfg := testConfig(t)
+	fvpnCfg := testFullVPNConfig(t)
+	exec := newFakeFullVPNExecutor()
+	exec.pid = 0 // kernel mode
+	fvpnMgr := NewFullVPNManager(fvpnCfg, exec)
+	fvpnMgr.peers = map[string]string{
+		"alice": "pubkey-alice",
+		"bob":   "pubkey-bob",
+	}
+
+	routeExec := &fakeExecutor{}
+	routeRes := newFakeResolver()
+	routeMgr := NewManager(cfg, routeExec, routeRes)
+	_ = routeMgr.EnsureFiles()
+
+	srv := httptest.NewServer(NewHandler(cfg, routeMgr, fvpnMgr))
+	t.Cleanup(srv.Close)
+	return srv, fvpnMgr, exec
+}
+
+func TestHandlerFullVPNEnableKernelMode(t *testing.T) {
+	srv, _, exec := newTestFullVPNServerKernel(t)
+
+	resp := doFullVPNPost(t, srv, fullvpnPath, "test-secret-token", fullvpnRequest{Peer: "alice"})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var r fullvpnResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !r.OK || r.Peer != "alice" || r.IP != "10.8.3.2" {
+		t.Errorf("unexpected response: %+v", r)
+	}
+	if r.Enabled == nil || !*r.Enabled {
+		t.Error("enabled should be true")
+	}
+
+	// Policy rule applied
+	if exec.PolicyRuleCallCount() != 1 {
+		t.Errorf("expected 1 policy rule call, got %d", exec.PolicyRuleCallCount())
+	}
+}
+
+func TestHandlerFullVPNDisableKernelMode(t *testing.T) {
+	srv, _, _ := newTestFullVPNServerKernel(t)
+
+	// Enable then disable
+	resp := doFullVPNPost(t, srv, fullvpnPath, "test-secret-token", fullvpnRequest{Peer: "alice"})
+	resp.Body.Close()
+
+	f := false
+	resp = doFullVPNPost(t, srv, fullvpnPath, "test-secret-token", fullvpnRequest{Peer: "alice", Enable: &f})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var r fullvpnResponse
+	json.NewDecoder(resp.Body).Decode(&r)
+	if r.Enabled == nil || *r.Enabled {
+		t.Error("enabled should be false")
+	}
+}
+
+func TestHandlerFullVPNListKernelMode(t *testing.T) {
+	srv, _, _ := newTestFullVPNServerKernel(t)
+
+	// Enable alice
+	resp := doFullVPNPost(t, srv, fullvpnPath, "test-secret-token", fullvpnRequest{Peer: "alice"})
+	resp.Body.Close()
+
+	// List
+	resp = doFullVPNPost(t, srv, fullvpnPath, "test-secret-token", struct{}{})
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var r fullvpnResponse
+	json.NewDecoder(resp.Body).Decode(&r)
+	if len(r.Overrides) != 1 {
+		t.Errorf("expected 1 override, got %d", len(r.Overrides))
 	}
 }
 
