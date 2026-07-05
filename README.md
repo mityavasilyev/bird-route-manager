@@ -37,12 +37,29 @@ sudo ./install.sh
 
 1. Installs Go and BIRD2 if not present
 2. Asks which VPN interface to use (lists what's available)
-3. Asks for the BGP peer (defaults to antifilter.network)
+3. Asks for the BGP peer (defaults to antifilter.network), plus any additional feeds
 4. Optionally enables the push API and generates a token
 5. Writes a full `bird.conf`, builds the binary, installs the systemd service
 6. Verifies the BGP session is established before exiting
 
 Re-run `sudo ./install.sh` at any time to reconfigure. Only what you confirm is changed.
+
+### Multiple BGP feeds
+
+Beyond the primary feed you can peer with any number of additional BGP route
+servers. `install.sh` offers to add the re:filter
+([1andrevich/Re-filter-lists](https://github.com/1andrevich/Re-filter-lists))
+public feed out of the box, or set your own in the env file:
+
+```
+# env: ';'-separated  name,peer_ip,peer_as[,local_as[,nexthop]]
+BGP_EXTRA_FEEDS=refilter,165.22.127.207,65412
+```
+
+Each feed becomes a `protocol bgp bgp_<name>` block; BIRD merges all feeds into one
+deduplicated table that is served to both local kernel routing and, if BGP Hub is
+enabled, downstream peers (feed protos are auto-added to `BGPHUB_EXPORT_PROTOS`).
+UFW is opened on `179/tcp` for each feed peer.
 
 ## Managing routes
 

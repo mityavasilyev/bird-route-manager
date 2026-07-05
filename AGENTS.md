@@ -1,14 +1,75 @@
-# bird-route-manager — agent context
+# Orion's Belt (evolving from bird-route-manager)
 
-Read this before touching anything. It covers what the project is, how it's structured, and decisions that aren't obvious from the code.
+Read this before touching anything. This file serves two purposes:
+1. Agent context for the current bird-route-manager code
+2. Vision and guidelines for the Orion's Belt evolution
 
 ---
 
-## What this is
+## Project vision
 
-A self-managing BIRD2 split-routing daemon for Linux VPS. It accepts mixed lists of IPs/CIDRs/domains/ASNs via a signed HTTP API, resolves them to IPv4 CIDRs, writes BIRD2 static route include files, and calls `birdc configure`. It also persists the raw (pre-resolution) lists and re-resolves them on a schedule so DNS changes are picked up automatically.
+bird-route-manager is evolving into **Orion's Belt** — a modular, self-deploying mesh
+infrastructure system. The binary name will be `belt`. The current routing code becomes
+one module among many. The evolution is incremental: bird-route-manager stays functional
+at every step.
 
-The intended use case: a Russian VPS running AmneziaWG/WireGuard as a VPN exit. Blocked sites go via the VPN interface; everything else via the ISP. BIRD2 handles routing. This tool manages the user-defined route lists on top of whatever BGP or other protocols BIRD2 is already running.
+**Design documents:** As the project evolves, architecture docs, operational design,
+and decision logs will live in this repo under `docs/`. Until then, the vision and
+key decisions are captured in this file.
+
+---
+
+## Core principles (revised after adversarial review)
+
+1. **Failsafe-first.** Every external dependency (DNS, BGP, Let's Encrypt, GitHub, Docker Hub,
+   APT repos) can disappear tomorrow. Cache locally, degrade gracefully, run on whatever
+   version is already installed. The mesh must survive a 72-hour internet partition with
+   zero operator intervention. Transport can be blocked → sidecar fallback.
+
+2. **Open-source secure (Kerckhoffs's principle).** Code is public. All security derives
+   from keys, never from code secrecy. Attacker knows everything except secrets.
+
+3. **Single binary, many modules.** One `belt` binary per node. Modules activated by config.
+   No containers, no interpreters, no runtime deps beyond libc. Cross-compile to any
+   architecture Go supports.
+
+3. **Local-first.** All state lives on the node. Mesh sync is eventually-consistent
+   replication, not a central database. No SPOF.
+
+4. **Explicit over automatic.** No auto-heal, no auto-failover (at current scale). Detect,
+   alert, let operator decide. Automatic actions limited to: cache refresh, cert renewal,
+   health check escalation, tunnel keepalive.
+
+5. **Idempotent everything.** Running install twice = same result. Running apply after
+   config change = converge to desired state.
+
+6. **Package relay.** Nodes that can reach distribution servers (GitHub, Docker Hub, APT)
+   relay artifacts to nodes that can't (e.g., behind Russian/Chinese firewalls). No node
+   should fail because it can't download a dependency.
+
+7. **Webhook-only alerting.** The binary sends alerts to a configurable webhook URL (JSON +
+   HMAC signature). The user's own system (n8n, custom handler, etc.) decides how to
+   deliver notifications. No Telegram/email/Slack logic in the binary.
+
+8. **Transport-agnostic.** WireGuard is the default but the system must support swapping
+   transports (VLESS, Shadowsocks, etc.) via sidecar binaries without code changes.
+   Node identity is Ed25519, not tied to any transport key.
+
+9. **Routing groups.** Traffic routes through named groups (europe, russia, banking, etc.),
+   not binary VPN/ISP. Each group has exit nodes with automatic failover.
+
+---
+
+## What this is right now
+
+A self-managing BIRD2 split-routing daemon for Linux VPS. It accepts mixed lists of
+IPs/CIDRs/domains/ASNs via a signed HTTP API, resolves them to IPv4 CIDRs, writes BIRD2
+static route include files, and calls `birdc configure`.
+
+**Current modules (will become Orion's Belt modules):**
+- Route management → `routing` module
+- Full-VPN per-peer override → `fullvpn` module
+- BGP Hub redistribution → `bgphub` module
 
 ---
 
@@ -17,15 +78,15 @@ The intended use case: a Russian VPS running AmneziaWG/WireGuard as a VPN exit. 
 | File | Purpose |
 |---|---|
 | `main.go` | Core service — route management, HTTP dispatch, entry point |
-| `fullvpn.go` | Full-VPN per-peer override module — separate executor, state, handlers |
-| `main_test.go` | Unit + e2e tests for core features — all system calls faked |
-| `fullvpn_test.go` | Tests for fullvpn module — fakeFullVPNExecutor |
-| `bgphub.go` | BGP Hub module — route redistribution to downstream BIRD2 peers |
+| `fullvpn.go` | Full-VPN per-peer override module |
+| `bgphub.go` | BGP Hub — route redistribution to downstream peers |
+| `main_test.go` | Unit + e2e tests for core |
+| `fullvpn_test.go` | Tests for fullvpn module |
 | `bgphub_test.go` | Tests for bgphub module |
-| `bgphub` | CLI script for managing downstream BGP peers (installed to `/usr/local/bin/bgphub`) |
+| `bgphub` | CLI script for managing BGP peers |
+| `install.sh` | Interactive idempotent installer |
 | `go.mod` | `go 1.25`, module `github.com/mityavasilyev/bird-route-manager` |
-| `install.sh` | Interactive idempotent installer — the user-facing entry point |
-| `TODO.md` | What has NOT been tested on real hardware — read before shipping |
+| `TODO.md` | What has NOT been tested on real hardware |
 | `README.md` | Public documentation |
 
 ---
@@ -62,25 +123,112 @@ Three injectable interfaces make everything testable without BIRD2 or real netwo
 - `Resolver` — `LookupHost()` and `LookupASN()` (faked in tests)
 - `FullVPNExecutor` — `WgPeers()`, `ContainerPID()`, `NATBypass()`, `PolicyRule()`, `EnsureRouteSetup()` (faked in tests)
 
-Tests spin up the full HTTP server with `httptest.NewServer` and make real HTTP requests against it. No mocking framework — just struct fakes in `main_test.go`.
+Tests spin up the full HTTP server with `httptest.NewServer` and make real HTTP requests.
+No mocking framework — just struct fakes.
 
 ---
 
-## Key design decisions
+## Key design decisions (current code)
 
-**Single project space.** Everything lives in `/opt/bird-route-manager/`: binary, env file, state, and the two BIRD2 route list files. The only files written outside are `/etc/systemd/system/bird-route-manager.service` and a managed section in `/etc/bird/bird.conf`. Easy to uninstall.
+**Single project space.** Everything in `/opt/bird-route-manager/`. Easy to uninstall.
 
-**Persist raw entries, not resolved CIDRs.** `state.json` stores what the user sent (`example.com`, `AS64496`) not the resolved IPs. On each refresh the full resolution runs again — this is how DNS changes get picked up. If we stored resolved CIDRs, a domain that rotated IPs would silently route to stale addresses.
+**Persist raw entries, not resolved CIDRs.** `state.json` stores `example.com`, not the
+resolved IPs. Periodic refresh picks up DNS changes.
 
-**VPN interface is a config, not a BIRD2 protocol.** The `VPN_INTERFACE` env var becomes `"wg0"` (quoted = interface name) in the BIRD2 `via` clause. This works for any tunnel type — WireGuard, OpenVPN, Xray TUN, etc. The service has no WireGuard-specific code.
+**VPN interface is a config, not a protocol.** Works for any tunnel type.
 
-**API is optional.** If `SYNC_TOKEN` is empty, the service starts normally (loads state, refreshes) but returns `503` on all API calls. This means the service is useful even without the push API — just edit `state.json` manually and restart.
+**API is optional.** Empty `SYNC_TOKEN` = service runs without API.
 
-**HMAC replay protection.** Auth is `HMAC-SHA256(token, "<timestamp>:<body>")`. Timestamp must be within ±5 minutes. This prevents replaying a captured request. Token is stored mode 600, never in logs.
+**HMAC replay protection.** `HMAC-SHA256(token, "<timestamp>:<body>")`, ±5 min window.
 
-**ISP nexthop is auto-detected.** `ip route show default` gives the gateway. No config needed. VPN nexthop is explicit config (interface name).
+**ISP nexthop is auto-detected.** `ip route show default`.
 
-**`install.sh` is idempotent by design.** It reads existing config from `env` and only changes what the user explicitly confirms. Safe to re-run after binary updates, token rotation, or interface changes. On first run it installs Go (if needed), builds the binary from source, writes a full `bird.conf`, and installs the systemd service. The intended flow is: `git clone` the repo onto the VPS, then `sudo ./install.sh`.
+**`install.sh` is idempotent.** Safe to re-run.
+
+---
+
+## Evolution guidelines
+
+### Go package layout (defined after adversarial review)
+
+```
+belt/
+  cmd/belt/main.go              # Entry point, module registration
+  internal/
+    core/                       # Config (TOML + role presets), lifecycle, API, CLI, node identity (Ed25519)
+      config.go                 # TOML parsing, defaults, validation, role presets
+      module.go                 # Module interface, ModuleInfo, registry
+      api.go                    # Unix socket + TCP API server
+      identity.go               # Ed25519 node.key generation and management
+    modules/
+      routing/                  # Current bird-route-manager + fullvpn + bgphub (internal)
+        routing.go              # Route management, groups, failover
+        resolver.go             # DNS + ASN resolution
+        executor.go             # Executor interface + system impl
+        birdconf.go             # BIRD2 config generation
+        fullvpn.go              # Per-peer VPN override (internal feature, not separate module)
+        bgphub.go               # BGP hub redistribution (internal feature)
+        groups.go               # Routing group management + failover logic
+      monitor/
+        monitor.go              # Health checks, metrics (bbolt)
+        alerts.go               # Alert pipeline + webhook dispatch (HMAC-signed)
+        checks.go               # Individual check implementations
+      mesh/
+        mesh.go                 # Peer registry, topology management
+        join.go                 # Join tokens (single-use, expiry, revocation)
+        announce.go             # Signed peer announcements (Ed25519)
+        sync.go                 # State sync between nodes
+    shared/                     # Types used across modules
+      types.go                  # ModuleInfo, FirewallRule, HealthCheck, etc.
+      atomicwrite.go            # Shared utilities
+      store.go                  # StateStore interface (bbolt default, JSON fallback)
+```
+
+### Adding new Orion's Belt modules
+
+1. Each module is a Go file (or package under `internal/modules/`) with a standard interface
+2. Module has: `Init()`, `Start()`, `Stop()`, `Health()`, `Status()` methods
+3. Module declares its config schema (TOML section)
+4. Module declares its firewall rules (ports it needs open)
+5. Module declares its health checks (what to monitor)
+6. All system interaction goes through injectable interfaces (like existing Executor pattern)
+7. Tests use struct fakes, not mocking frameworks
+
+### Config format
+
+TOML. File at `/etc/belt/config.toml`. One file per node.
+
+### Backward compatibility
+
+During evolution, these must keep working:
+- `install.sh` for fresh bird-route-manager deployments
+- API on `127.0.0.1:8081` for `sync-lists.sh`
+- `bgphub` CLI script
+- Existing state files (`state.json`, `fullvpn-state.json`, `bgphub-peers.json`)
+- `awg-mode` functionality (absorbed into `belt vpn mode`)
+
+### Testing
+
+- **Unit tests:** Same pattern — injectable interfaces, struct fakes
+- **E2E tests:** Docker containers emulating VPS nodes. Each container = one "VPS"
+  with its own network namespace. Docker Compose for 3-node mesh (exit + hub + client).
+- Run `go test -race ./...` before every commit
+- E2E suite: `make test-e2e` (Docker Compose up, run tests, down)
+
+### What NOT to do
+
+- Don't break current bird-route-manager functionality while evolving
+- Don't add external Go dependencies beyond the approved set (BurntSushi/toml, bbolt)
+- Don't implement auto-failover until there are 2+ exit nodes
+- Don't add Telegram/email/Slack to the binary — alerts go to webhook only
+- Don't hardcode IPs — everything comes from config
+- Don't assume internet is available — every feature must work in degraded mode
+- Don't use mocking frameworks — struct fakes are the pattern here
+- Don't create separate binaries — one binary, module flags (sidecar transports are exceptions)
+- Don't derive security from code secrecy — code is open source, security = keys only
+- Don't implement custom crypto — use standard algorithms, shell out to `age` for encryption
+- Don't implement ACME — shell out to `certbot`
+- Don't tie node identity to WireGuard keys — use separate Ed25519 `node.key`
 
 ---
 
@@ -93,106 +241,50 @@ Tests spin up the full HTTP server with `httptest.NewServer` and make real HTTP 
 router id <PUBLIC_IP>;
 protocol device { scan time 10; }
 protocol static vpn_nexthop { route 0.0.0.0/0 via "<VPN_INTERFACE>"; }
-protocol kernel { ipv4 { export filter { antifilter + user_vpn + user_isp }; }; }
-protocol bgp antifilter { ... }
+protocol kernel { ipv4 { export filter { bgp_feed + <extra feeds> + user_vpn + user_isp + dnsmasq_isp }; }; }
+protocol bgp bgp_feed { ... }          # primary feed (antifilter)
+protocol bgp bgp_<name> { ... }        # one per BGP_EXTRA_FEEDS entry (e.g. bgp_refilter)
 include "/opt/bird-route-manager/bird-extra.conf";
 # ---- bird-route-manager end ----
 ```
 
-`bird-extra.conf` (also in WorkDir) contains the two `protocol static user_vpn / user_isp` blocks that include the route list files. On re-runs, `install.sh` replaces just the managed section using a Python one-liner — it never touches anything outside the delimiters.
+On re-runs, replaces just the managed section. Never touches anything outside delimiters.
 
-On re-install with an existing `bird.conf` that has no managed section, `install.sh` replaces the entire file (backing up the original). This avoids duplicate protocol definitions from Ubuntu's default `bird.conf`.
+### Multiple BGP feeds (`BGP_EXTRA_FEEDS`)
+
+The primary feed (`BGP_PEER_IP`/`BGP_PEER_AS`/…) is `bgp_feed`. Additional feeds are
+configured via `BGP_EXTRA_FEEDS` in the env file — a `;`-separated list of
+`name,peer_ip,peer_as[,local_as[,nexthop]]` (local_as/nexthop default to the primary
+feed's). `install.sh` renders one `protocol bgp bgp_<name>` per entry, all import-only
+with the nexthop rewritten to the shared sentinel, so **BIRD merges every feed into one
+deduplicated routing table**. Each feed proto is auto-added to the kernel export filter
+(so this node's own VPN clients get the union) and appended to `BGPHUB_EXPORT_PROTOS`
+(so downstream BGP subscribers get the union too). `install.sh` also opens `179/tcp` in
+UFW for each extra feed peer. No list-merging code — BIRD's route table *is* the merge.
+
+Example: `BGP_EXTRA_FEEDS=refilter,165.22.127.207,65412` adds the re:filter
+(1andrevich/Re-filter-lists) public BGP feed alongside antifilter.
 
 ---
 
 ## dnsmasq ipset layer (optional)
 
-When `DNSMASQ_IPSET` env var is set, the service reads a kernel ipset on every apply/refresh and writes a separate BIRD2 route file (`dnsmasq-isp.list`). This enables TLD-based ISP routing — e.g. all `.ru` domains go via ISP instead of VPN.
-
-**How it works:** dnsmasq is configured with `ipset=/.ru/tld_isp` — every DNS query for a `.ru` domain adds the resolved IPs to the `tld_isp` kernel ipset with a timeout (default 6h). bird-route-manager reads this ipset via `Executor.ReadIPSet()`, writes the IPs as BIRD2 static routes via ISP gateway, and reloads. The `dnsmasq_isp` protocol has preference 150 (beats BGP at 100, loses to user lists at 200). Ipset entries auto-expire, so stale IPs fall back to normal routing.
-
-`install.sh` handles the full setup: dnsmasq + ipset packages, dnsmasq config, ipset boot-persistence systemd unit, BIRD2 `dnsmasq_isp` protocol block, and kernel export filter.
-
-**Config:** `DNSMASQ_IPSET` (ipset name), `DNSMASQ_TLDS` (space-separated TLDs), `DNSMASQ_IPSET_TIMEOUT` (seconds, 0 = no expiry).
+When `DNSMASQ_IPSET` is set, reads kernel ipset, writes BIRD2 route file for TLD-based
+ISP routing (e.g. `.ru` → ISP). See `AGENTS.md` for details.
 
 ---
 
 ## Full-VPN per-peer override (optional)
 
-When `FULLVPN_ENABLED=true`, the service can temporarily route individual VPN peers through the VPN tunnel for ALL traffic (bypassing split routing).
-
-**Dual-mode support (kernel + Docker):** The fullvpn module works with AmneziaWG in both configurations:
-
-| | Docker mode | Kernel mode |
-|---|---|---|
-| **WG interface** | Inside container (`docker exec wg show`) | On host (`awg show wg0`) |
-| **NAT bypass** | `nsenter` iptables RETURN in container netns | No-op — traffic keeps original source IP |
-| **Route setup** | Bridge route + host MASQUERADE | Only fulltunnel table route (PostUp handles MASQUERADE) |
-| **Detection** | Container running, `awg show` fails on host | `awg show <iface>` succeeds on host |
-
-Mode is auto-detected at startup via `DetectWgMode()` and locked for the process lifetime. The `FullVPNExecutor` interface handles both — `ContainerPID()` returns 0 as a sentinel in kernel mode, and `NATBypass()` is a no-op when `kernelMode` is set. **After switching WireGuard mode with `awg-mode`, restart `bird-route-manager.service` to re-detect.**
-
-**Why kernel mode doesn't need NAT bypass:** In Docker mode, the container masquerades all peer traffic (`10.8.3.x → 172.29.172.2`) before it reaches the host, so the host can't distinguish peers. The NAT bypass rule makes the container skip masquerade for a specific peer. In kernel mode, wg0 is on the host — traffic arrives with the peer's original source IP, so `ip rule from <peer_ip>` works directly without any NAT manipulation.
-
-**Module structure:** `fullvpn.go` is a self-contained module with its own `FullVPNExecutor` interface (separate from the main `Executor`), state management, and HTTP handlers. All system interaction is isolated in the executor — mode-specific behavior lives in `systemFullVPNExecutor`.
-
-**State files:**
-- `peers.json` — name→pubkey mapping, managed via `POST /api/v1/peers`
-- `fullvpn-state.json` — active overrides with expiry times
-
-**API endpoints** (same HMAC auth as `/api/v1/routes`):
-- `POST /api/v1/fullvpn` — enable/disable/list overrides
-- `POST /api/v1/peers` — set/list peer name→pubkey mappings
-
-**Config:** `FULLVPN_ENABLED`, `AWG_CONTAINER`, `AWG_WG_INTERFACE`, `AWG_CONTAINER_IFACE`, `FULLVPN_TABLE`, `FULLVPN_DURATION` (seconds), `FULLVPN_CLEANUP` (seconds), `FULLVPN_SUBNET`, `FULLVPN_BRIDGE`, `FULLVPN_BRIDGE_IP`. Docker-specific settings (`AWG_CONTAINER`, `AWG_CONTAINER_IFACE`, `FULLVPN_BRIDGE`, `FULLVPN_BRIDGE_IP`) are ignored in kernel mode.
-
-**One-time host setup** (handled by `install.sh` + service startup):
-- `/etc/iproute2/rt_tables` gets `100 fulltunnel` entry (install.sh, persistent)
-- Service calls `EnsureRouteSetup()` on startup: sets default route in fulltunnel table via VPN interface. In Docker mode also sets bridge route + MASQUERADE. In kernel mode, PostUp in wg0.conf already handles MASQUERADE.
+When `FULLVPN_ENABLED=true`, temporarily route individual peers through full VPN tunnel.
+Dual-mode: kernel WireGuard + Docker. Auto-detected at startup. See `AGENTS.md` for details.
 
 ---
 
-## BGP Hub — route redistribution to downstream peers (optional)
+## BGP Hub (optional)
 
-When `BGPHUB_ENABLED=true`, the service generates a BIRD2 config file (`bgphub-peers.conf`) that re-exports `bgp_feed` + `user_vpn` routes to downstream BIRD2 peers. This lets a central VPS act as a BGP route hub for home routers and other clients connected via VPN.
-
-**How it works:** On startup, the service reads `bgphub-peers.json` (managed by the `bgphub` CLI), generates `bgphub-peers.conf` with an export filter and per-peer protocol blocks, writes it atomically, and calls `birdc configure`. The generated config is included from `bird-extra.conf`.
-
-**No HTTP API.** Peers are managed via the `bgphub` CLI on the VPS:
-```bash
-bgphub add home-router 10.8.3.8 64998   # register a peer
-bgphub remove 10.8.3.8                   # remove by IP
-bgphub list                               # show all peers
-```
-
-After add/remove, the CLI restarts bird-route-manager which regenerates the config.
-
-**Generated BIRD2 config** (`bgphub-peers.conf`):
-```bird
-filter bgphub_export {
-    if proto = "bgp_feed" then { bgp_next_hop = 10.8.3.0; accept; }
-    if proto = "user_vpn" then { bgp_next_hop = 10.8.3.0; accept; }
-    reject;
-}
-
-protocol bgp bgphub_home_router {
-    local as 64999;
-    neighbor 10.8.3.8 as 64998;
-    hold time 240;
-    ipv4 {
-        import none;
-        export filter bgphub_export;
-    };
-}
-```
-
-**Config:** `BGPHUB_ENABLED`, `BGPHUB_NEXTHOP` (sentinel IP for downstream peers, typically the VPS's VPN IP), `BGPHUB_LOCAL_AS`, `BGPHUB_EXPORT_PROTOS` (comma-separated protocol names), `BGPHUB_ALLOWED_SUBNET` (used by CLI for validation).
-
-**Client setup:** Downstream clients use `install.sh` as-is — they just enter the hub VPS's VPN IP as the BGP peer and the hub's AS number. No client-side code changes needed.
-
-**State files:**
-- `bgphub-peers.json` — peer list (managed by CLI)
-- `bgphub-peers.conf` — generated BIRD2 config (managed by service)
+When `BGPHUB_ENABLED=true`, re-exports routes to downstream peers. Managed via `bgphub`
+CLI. See `AGENTS.md` for details.
 
 ---
 
@@ -203,32 +295,18 @@ go test -race ./...   # ~1.5s
 go vet ./...
 ```
 
-Tests are in `main_test.go` and `fullvpn_test.go` in the same package (`package main`) so they can access unexported types.
+Tests cover: HMAC auth, entry classification, dedup, route file format, atomic writes,
+state persistence, refresh, HTTP handlers, fullvpn, bgphub, rollback on failure.
 
-What the tests cover: HMAC auth, entry classification, deduplication, route file format, atomic writes, state persistence across simulated restarts, background refresh, HTTP handler auth/rate-limit/error paths, concurrent pushes, interface nexthop format, server header suppression, dnsmasq ipset parsing/apply/disable/errors/refresh, fullvpn peer lookup (by name/pubkey), fullvpn enable/disable/expiry/cleanup, fullvpn state persistence, fullvpn HTTP handlers (enable/disable/list/peers/auth), rollback on partial failure.
-
-What the tests do NOT cover: actual `birdc` execution, actual kernel routes, actual DNS, actual RIPE API, actual `ipset` commands, actual `docker exec`/`nsenter`, `install.sh`. See `TODO.md` for the full list and a smoke-test script to run on a real VPS.
+Tests do NOT cover: actual birdc, kernel routes, real DNS/RIPE API, actual Docker/nsenter,
+install.sh. See `TODO.md`.
 
 ---
 
 ## What to be careful about
 
-- **Never put the BIRD2 BGP peer IP in `user-vpn.list`.** If the antifilter BGP peer (`45.154.73.71` in the known deployment) ends up in that list, BIRD routes its own TCP connection to the peer via the VPN interface. The peer closes the connection, BGP drops, all ~16k antifilter routes vanish. This is an operator concern, not something the service can prevent — but worth knowing if you're extending the API or adding auto-population features.
-
-- **`birdc configure` must succeed before `saveState`.** The current code saves state only after a successful apply. If `birdc configure` fails, state is not updated — the previous lists remain in state. This is intentional: don't persist a broken configuration.
-
-- **Atomic writes use same-directory temp files.** `os.CreateTemp(dir, ...)` + `os.Rename` is atomic on Linux. If `WorkDir` and the temp file end up on different filesystems this breaks. Not a realistic concern for the current layout but worth knowing.
-
-- **`go 1.25` uses `strings.SplitSeq`** (range-over iterator, introduced in 1.23). Don't downgrade the module version without replacing that call.
-
-- **The `Server` HTTP header is cleared** in `jsonResp`. Don't add middleware that re-sets it.
-
----
-
-## Adding features
-
-**New entry type** (e.g. IPv6): add a case to `classify()`, handle it in `resolveEntries()`, update `cleanEntries()` validation, add tests. The route file writer and state persistence need no changes.
-
-**New API endpoint**: add a `case` to the `switch r.URL.Path` in `NewHandler`. Keep the pattern: unknown path → 404 (don't reveal path existence). Use `verifyAndReadBody()` for auth.
-
-**Web UI**: out of scope for this tool. The service is designed to be driven by external automation (cron jobs, scripts). A UI belongs in a separate companion tool.
+- **Never put BGP peer IP in `user-vpn.list`.** Kills BGP session, drops ~27K routes.
+- **`birdc configure` must succeed before `saveState`.** Don't persist broken config.
+- **Atomic writes need same filesystem.** `os.CreateTemp(dir) + os.Rename`.
+- **`go 1.25` uses `strings.SplitSeq`.** Don't downgrade module version.
+- **`Server` HTTP header is cleared.** Don't re-set it in middleware.

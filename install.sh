@@ -96,6 +96,38 @@ env_set() {
     fi
 }
 
+# sanitize_bird_name mirrors bgphub.go's sanitizeBIRDName: lowercase, non-alnum
+# collapsed to '_', trimmed. Used to derive a BIRD2 protocol name from a feed name.
+sanitize_bird_name() {
+    local s
+    s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//')
+    [[ -z "$s" ]] && s="feed"
+    printf '%s' "$s"
+}
+
+# emit_bgp_feed_block prints a BIRD2 `protocol bgp` block for one route feed.
+# All feeds import-only, rewrite nexthop to the shared sentinel (resolved via the
+# VPN interface by vpn_nexthop), and never export. Identical shape to the primary
+# antifilter feed so BIRD merges/deduplicates every feed into one routing table.
+emit_bgp_feed_block() {
+    local proto="$1" local_as="$2" peer_ip="$3" peer_as="$4" nexthop="$5"
+    cat << EOF
+protocol bgp ${proto} {
+    local as ${local_as};
+    neighbor ${peer_ip} as ${peer_as};
+    multihop;
+    hold time 240;
+    ipv4 {
+        import filter {
+            bgp_next_hop = ${nexthop};
+            accept;
+        };
+        export none;
+    };
+}
+EOF
+}
+
 detect_public_ip() {
     local ip
     ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
@@ -277,6 +309,63 @@ else
     BGP_NEXTHOP="$CURRENT_BGP_NH"
     ok "Using antifilter.network defaults"
 fi
+
+# ── Additional BGP feeds (optional, N feeds) ──
+#
+# The primary feed above is antifilter. Extra feeds are peered the same way and
+# BIRD merges them all into one deduplicated routing table, which is then
+# exported to VPN clients (kernel) and downstream BGP peers (bgphub). Stored in
+# env as BGP_EXTRA_FEEDS: ';'-separated "name,peer_ip,peer_as[,local_as[,nexthop]]".
+# local_as/nexthop default to the primary feed's values when omitted.
+REFILTER_FEED="refilter,165.22.127.207,65412"
+CURRENT_EXTRA_FEEDS=$(env_get "BGP_EXTRA_FEEDS" "")
+BGP_EXTRA_FEEDS="$CURRENT_EXTRA_FEEDS"
+
+echo ""
+note "Additional BGP feeds are merged with the primary feed in BIRD's routing"
+note "table (deduplicated) and served to both VPN clients and downstream peers."
+if [[ -n "$CURRENT_EXTRA_FEEDS" ]]; then
+    echo -e "  Extra feeds: ${CYAN}${CURRENT_EXTRA_FEEDS}${RESET}"
+fi
+if [[ "$CURRENT_EXTRA_FEEDS" != *"165.22.127.207"* ]]; then
+    if ask_yn "Add re:filter (1andrevich) as an additional BGP feed?" y; then
+        if [[ -n "$BGP_EXTRA_FEEDS" ]]; then
+            BGP_EXTRA_FEEDS="${BGP_EXTRA_FEEDS};${REFILTER_FEED}"
+        else
+            BGP_EXTRA_FEEDS="$REFILTER_FEED"
+        fi
+        ok "Added re:filter feed: 165.22.127.207 AS65412"
+    fi
+fi
+note "Advanced: edit BGP_EXTRA_FEEDS in $ENV_FILE to add/remove feeds"
+note "(format: name,peer_ip,peer_as separated by ';'), then re-run to apply."
+
+# Parse BGP_EXTRA_FEEDS into the artifacts consumed later: per-feed BIRD blocks,
+# kernel export accepts, the proto-name list (for bgphub), and peer IPs (for UFW).
+EXTRA_BGP_BLOCKS=""
+EXTRA_KERNEL_ACCEPTS=""
+EXTRA_FEED_PROTOS=""
+EXTRA_FEED_PEERS=""
+if [[ -n "$BGP_EXTRA_FEEDS" ]]; then
+    _old_ifs="$IFS"
+    IFS=';'
+    for _feed in $BGP_EXTRA_FEEDS; do
+        IFS=',' read -r _fname _fip _fas _flocal _fnh <<< "$_feed"
+        _fname=$(printf '%s' "$_fname" | tr -d '[:space:]')
+        _fip=$(printf '%s' "$_fip" | tr -d '[:space:]')
+        _fas=$(printf '%s' "$_fas" | tr -d '[:space:]')
+        [[ -z "$_fname" || -z "$_fip" || -z "$_fas" ]] && continue
+        _flocal="${_flocal:-$BGP_LOCAL_AS}"
+        _fnh="${_fnh:-$BGP_NEXTHOP}"
+        _proto="bgp_$(sanitize_bird_name "$_fname")"
+        EXTRA_BGP_BLOCKS+=$'\n'"$(emit_bgp_feed_block "$_proto" "$_flocal" "$_fip" "$_fas" "$_fnh")"$'\n'
+        EXTRA_KERNEL_ACCEPTS+="            if proto = \"${_proto}\"    then accept;"$'\n'
+        EXTRA_FEED_PROTOS+="${_proto},"
+        EXTRA_FEED_PEERS+="${_fname} ${_fip}"$'\n'
+    done
+    IFS="$_old_ifs"
+fi
+EXTRA_FEED_PROTOS="${EXTRA_FEED_PROTOS%,}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [4/6] Remote updates and refresh
@@ -562,6 +651,22 @@ else
     BGPHUB_PROTOS="$CURRENT_BGPHUB_PROTOS"
 fi
 
+# Ensure every configured BGP feed is re-exported to downstream peers. Without
+# this, an added feed (e.g. re:filter) would reach this node's own VPN clients
+# via the kernel table but NOT the downstream BGP subscribers.
+if $ENABLE_BGPHUB && [[ -n "$EXTRA_FEED_PROTOS" ]]; then
+    _old_ifs="$IFS"
+    IFS=','
+    for _p in $EXTRA_FEED_PROTOS; do
+        [[ -z "$_p" ]] && continue
+        if [[ ",${BGPHUB_PROTOS}," != *",${_p},"* ]]; then
+            BGPHUB_PROTOS="${BGPHUB_PROTOS},${_p}"
+            ok "BGP Hub: re-export feed proto ${_p} to downstream peers"
+        fi
+    done
+    IFS="$_old_ifs"
+fi
+
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -766,6 +871,7 @@ env_set "BGP_PEER_IP"   "$BGP_PEER_IP"
 env_set "BGP_PEER_AS"   "$BGP_PEER_AS"
 env_set "BGP_LOCAL_AS"  "$BGP_LOCAL_AS"
 env_set "BGP_NEXTHOP"   "$BGP_NEXTHOP"
+env_set "BGP_EXTRA_FEEDS" "$BGP_EXTRA_FEEDS"
 env_set "REFRESH_HOURS" "$REFRESH_HOURS"
 env_set "WORK_DIR"      "$WORK_DIR"
 
@@ -863,6 +969,21 @@ if $ENABLE_BGPHUB; then
     fi
 fi
 
+# 5d4 — UFW: allow inbound BGP (179/tcp) from each additional feed peer.
+# The primary feed's rule is managed out-of-band; this covers BGP_EXTRA_FEEDS so
+# adding a feed also opens the firewall for it. Idempotent — skips existing rules.
+if [[ -n "$EXTRA_FEED_PEERS" ]] && command -v ufw &>/dev/null; then
+    while read -r _fname _fip; do
+        [[ -z "$_fip" ]] && continue
+        if ! ufw status 2>/dev/null | grep -q "179/tcp.*${_fip}"; then
+            ufw allow from "$_fip" to any port 179 proto tcp comment "BGP feed ${_fname}" > /dev/null 2>&1 || true
+            ok "UFW: allowed BGP from ${_fip} (${_fname})"
+        else
+            ok "UFW: BGP rule for ${_fip} already present"
+        fi
+    done <<< "$EXTRA_FEED_PEERS"
+fi
+
 # 5e — BIRD2 extra config (static protocol blocks included by bird.conf)
 {
     cat << EXTRAEOF
@@ -934,7 +1055,7 @@ protocol kernel {
             if proto = "user_vpn"    then accept;
             if proto = "user_isp"    then accept;
             if proto = "dnsmasq_isp" then accept;
-            reject;
+${EXTRA_KERNEL_ACCEPTS}            reject;
         };
     };
 }
@@ -952,7 +1073,7 @@ protocol bgp bgp_feed {
         export none;
     };
 }
-
+${EXTRA_BGP_BLOCKS}
 include "$BIRD_EXTRA_CONF";
 $MANAGED_BIRD_END
 EOF
@@ -1204,6 +1325,9 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 echo -e "  VPN interface:  ${CYAN}$VPN_INTERFACE${RESET}"
 echo -e "  BGP feed:       ${CYAN}$BGP_PEER_IP AS$BGP_PEER_AS${RESET}"
+if [[ -n "$BGP_EXTRA_FEEDS" ]]; then
+    echo -e "  Extra feeds:    ${CYAN}${BGP_EXTRA_FEEDS}${RESET}"
+fi
 echo -e "  Refresh:        ${CYAN}every ${REFRESH_HOURS}h${RESET}"
 if $ENABLE_DNSMASQ; then
     echo -e "  TLD routing:    ${CYAN}${DNSMASQ_TLDS} → ipset ${DNSMASQ_IPSET_NAME}${RESET} (pref 150, timeout ${DNSMASQ_TIMEOUT}s)"
